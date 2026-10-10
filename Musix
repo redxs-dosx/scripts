@@ -1,0 +1,2199 @@
+--[[
+    Musix - in-game music player (Delta Executor / mobile)
+
+    Put .mp3 / .ogg / .wav files in your executor's workspace folder:  Musix/
+    (the script creates it on first run). New files show up automatically.
+
+    - Title / artist / cover are read from the file's tags (ID3 for mp3,
+      Vorbis comments for ogg). wav files and untagged files use the file name
+      ("Artist - Title.mp3" is split automatically).
+    - Covers + tag info are cached in Musix/.cache so the next launch is fast.
+    - The "S" button switches the sidebar between your Musix folder playlist and
+      "songs on Roblox": search any audio by name, or paste a Roblox song ID.
+]]
+
+-- ========= Settings =========
+local WINDOW_TRANSPARENCY = 0.15              -- 0.15 = 85% opacity
+local BLUR_SIZE           = 18                -- background blur while the window is open
+local AUTO_PILL          = true              -- pill finds the end of the topbar buttons by itself (stays put if the topbar changes)
+local PILL_GAP           = 8                 -- space between the last topbar button and the pill
+local PILL_X              = 195               -- bigger = pill moves right (past the Roblox topbar icons)
+local PILL_Y_OFFSET       = 6                 -- bigger = pill moves down
+local PILL_WIDTH          = 240
+
+local ROOT  = "Musix"
+local CACHE = ROOT .. "/.cache"
+local INDEX = CACHE .. "/index.json"
+
+-- ========= Services =========
+local Players          = game:GetService("Players")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local SoundService     = game:GetService("SoundService")
+local Lighting         = game:GetService("Lighting")
+local GuiService       = game:GetService("GuiService")
+local HttpService      = game:GetService("HttpService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ========= Theme =========
+local Theme = {
+    Background = Color3.fromRGB(12, 12, 14),
+    Sidebar    = Color3.fromRGB(0, 0, 0),
+    Panel      = Color3.fromRGB(30, 30, 38),
+    Element    = Color3.fromRGB(50, 50, 58),
+    Hover      = Color3.fromRGB(70, 70, 80),
+    Accent     = Color3.fromRGB(30, 215, 96),
+    Text       = Color3.fromRGB(255, 255, 255),
+    SubText    = Color3.fromRGB(179, 179, 179),
+    Topbar     = Color3.fromRGB(18, 18, 21),
+}
+
+-- ========= Executor capability checks =========
+local assetFn = getcustomasset or getsynasset
+local fsOk = type(writefile) == "function" and type(readfile) == "function"
+    and type(listfiles) == "function" and type(isfolder) == "function"
+    and type(makefolder) == "function" and type(isfile) == "function"
+
+-- ========= Parent GUI (executor-safe) =========
+local function getGuiParent()
+    local ok, hui = pcall(function() return gethui and gethui() end)
+    if ok and hui then return hui end
+    local ok2, core = pcall(function() return game:GetService("CoreGui") end)
+    if ok2 and core then
+        local t = Instance.new("Folder")
+        local ok3 = pcall(function() t.Parent = core end)
+        t:Destroy()
+        if ok3 then return core end
+    end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local parent = getGuiParent()
+if parent:FindFirstChild("Musix") then
+    parent.Musix:Destroy()
+end
+for _, o in ipairs(Lighting:GetChildren()) do
+    if o.Name == "MusixBlur" then o:Destroy() end
+end
+for _, o in ipairs(SoundService:GetChildren()) do
+    if o.Name == "MusixSound" then o:Destroy() end
+end
+
+-- ========= UI helpers =========
+local function create(class, props, children)
+    local inst = Instance.new(class)
+    for k, v in pairs(props or {}) do
+        inst[k] = v
+    end
+    for _, child in ipairs(children or {}) do
+        child.Parent = inst
+    end
+    return inst
+end
+
+local function corner(radius)
+    return create("UICorner", { CornerRadius = radius })
+end
+
+local function tween(obj, t, props)
+    TweenService:Create(obj, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+local function tweenEx(obj, t, style, dir, props)
+    local tw = TweenService:Create(obj, TweenInfo.new(t, style, dir), props)
+    tw:Play()
+    return tw
+end
+
+local function fmtTime(sec)
+    sec = math.max(0, math.floor(sec))
+    return string.format("%d:%02d", math.floor(sec / 60), sec % 60)
+end
+
+local alive = true
+local conns = {}
+local function track(c)
+    conns[#conns + 1] = c
+    return c
+end
+
+-- =====================================================================
+--  TAG READING (ID3 for mp3, Vorbis comments for ogg)
+-- =====================================================================
+local function trim(s)
+    return (s:match("^%s*(.-)%s*$"))
+end
+
+local function cutNull(s)
+    local i = s:find("\0", 1, true)
+    if i then return s:sub(1, i - 1) end
+    return s
+end
+
+local function latin1(s)
+    local out = table.create(#s)
+    for i = 1, #s do
+        local b = s:byte(i)
+        out[i] = b < 128 and string.char(b) or utf8.char(b)
+    end
+    return table.concat(out)
+end
+
+local function utf16(s, forceBE)
+    local i, be = 1, forceBE or false
+    local b1, b2 = s:byte(1, 2)
+    if b1 == 0xFF and b2 == 0xFE then
+        be = false; i = 3
+    elseif b1 == 0xFE and b2 == 0xFF then
+        be = true; i = 3
+    end
+    local out = {}
+    while i + 1 <= #s do
+        local a, b = s:byte(i, i + 1)
+        local cu = be and (a * 256 + b) or (b * 256 + a)
+        i += 2
+        if cu >= 0xD800 and cu < 0xDC00 and i + 1 <= #s then
+            local a2, b2b = s:byte(i, i + 1)
+            local lo = be and (a2 * 256 + b2b) or (b2b * 256 + a2)
+            if lo >= 0xDC00 and lo < 0xE000 then
+                cu = 0x10000 + (cu - 0xD800) * 1024 + (lo - 0xDC00)
+                i += 2
+            end
+        end
+        if cu == 0 then break end
+        if cu < 0xD800 or cu >= 0xE000 then
+            out[#out + 1] = utf8.char(cu)
+        end
+    end
+    return table.concat(out)
+end
+
+local function decodeText(enc, s)
+    if enc == 1 then return utf16(s) end
+    if enc == 2 then return utf16(s, true) end
+    s = cutNull(s)
+    if enc == 3 and utf8.len(s) then return s end
+    if utf8.len(s) and enc ~= 0 then return s end
+    return latin1(s)
+end
+
+local function u32le(s, i)
+    local a, b, c, d = s:byte(i, i + 3)
+    return a + b * 256 + c * 65536 + d * 16777216
+end
+
+local function u32be(s, i)
+    local a, b, c, d = s:byte(i, i + 3)
+    return a * 16777216 + b * 65536 + c * 256 + d
+end
+
+local function synchsafe(a, b, c, d)
+    return a * 2097152 + b * 16384 + c * 128 + d
+end
+
+local function imgExt(bytes)
+    if bytes:sub(1, 8) == "\137PNG\r\n\26\n" then return "png" end
+    if bytes:sub(1, 2) == "\255\216" then return "jpg" end
+    return nil
+end
+
+local function getText(body)
+    local enc = body:byte(1)
+    if not enc then return nil end
+    local t = trim(decodeText(enc, body:sub(2)))
+    if t == "" then return nil end
+    return t
+end
+
+local function parseAPIC(body, ver)
+    local enc = body:byte(1)
+    local p
+    if ver == 2 then
+        p = 5 -- enc(1) + 3 char image format
+    else
+        local z = body:find("\0", 2, true)
+        if not z then return nil end
+        p = z + 1
+    end
+    local ptype = body:byte(p)
+    p += 1
+    if enc == 1 or enc == 2 then
+        local q = p
+        while q + 1 <= #body and not (body:byte(q) == 0 and body:byte(q + 1) == 0) do
+            q += 2
+        end
+        p = q + 2
+    else
+        local z = body:find("\0", p, true)
+        if not z then return nil end
+        p = z + 1
+    end
+    return body:sub(p), ptype
+end
+
+local function parseID3(data)
+    local info = {}
+    if data:sub(1, 3) ~= "ID3" then return info end
+    local ver = data:byte(4)
+    local flags = data:byte(6)
+    local sz = synchsafe(data:byte(7, 10))
+    local pos = 11
+    local tagEnd = math.min(10 + sz, #data)
+
+    if ver >= 3 and bit32.band(flags, 0x40) ~= 0 then
+        local a, b, c, d = data:byte(pos, pos + 3)
+        if ver == 4 then
+            pos += synchsafe(a, b, c, d)
+        else
+            pos += 4 + u32be(data, pos)
+        end
+    end
+
+    local idLen = (ver == 2) and 3 or 4
+    local hdrLen = (ver == 2) and 6 or 10
+
+    while pos + hdrLen <= tagEnd do
+        local id = data:sub(pos, pos + idLen - 1)
+        if #id < idLen or id:byte(1) == 0 then break end
+
+        local size
+        if ver == 2 then
+            local a, b, c = data:byte(pos + 3, pos + 5)
+            size = a * 65536 + b * 256 + c
+        elseif ver == 4 then
+            size = synchsafe(data:byte(pos + 4, pos + 7))
+        else
+            size = u32be(data, pos + 4)
+        end
+
+        local bodyStart = pos + hdrLen
+        local body = data:sub(bodyStart, bodyStart + size - 1)
+        pos = bodyStart + size
+
+        if size > 0 then
+            if id == "TIT2" or id == "TT2" then
+                info.title = info.title or getText(body)
+            elseif id == "TPE1" or id == "TP1" then
+                info.artist = info.artist or getText(body)
+            elseif id == "TALB" or id == "TAL" then
+                info.album = info.album or getText(body)
+            elseif id == "APIC" or id == "PIC" then
+                local img, ptype = parseAPIC(body, ver)
+                if img and #img > 0 and (not info.image or ptype == 3) then
+                    info.image = img
+                end
+            end
+        end
+    end
+    return info
+end
+
+-- ---- base64 (for ogg embedded covers) ----
+local B64 = {}
+do
+    local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    for i = 1, 64 do B64[chars:byte(i)] = i - 1 end
+end
+
+local function b64decode(s)
+    s = s:gsub("[^%w%+/]", "")
+    local out = {}
+    local n = #s
+    for i = 1, n - n % 4, 4 do
+        local a, b, c, d = s:byte(i, i + 3)
+        local v = B64[a] * 262144 + B64[b] * 4096 + B64[c] * 64 + B64[d]
+        out[#out + 1] = string.char(math.floor(v / 65536) % 256, math.floor(v / 256) % 256, v % 256)
+    end
+    local rest = n % 4
+    if rest >= 2 then
+        local a, b, c = s:byte(n - rest + 1, n - rest + 3)
+        local v = B64[a] * 262144 + B64[b] * 4096 + (c and B64[c] or 0) * 64
+        out[#out + 1] = string.char(math.floor(v / 65536) % 256)
+        if rest == 3 then out[#out + 1] = string.char(math.floor(v / 256) % 256) end
+    end
+    return table.concat(out)
+end
+
+local function parseFlacPicture(bin)
+    local p = 5
+    local mlen = u32be(bin, p); p += 4 + mlen
+    local dlen = u32be(bin, p); p += 4 + dlen
+    p += 16
+    local len = u32be(bin, p); p += 4
+    return bin:sub(p, p + len - 1)
+end
+
+local function oggPackets(data, want)
+    local packets, cur = {}, {}
+    local pos = 1
+    while pos + 27 <= #data and #packets < want do
+        if data:sub(pos, pos + 3) ~= "OggS" then break end
+        local nseg = data:byte(pos + 26)
+        local lace = { data:byte(pos + 27, pos + 26 + nseg) }
+        local dpos = pos + 27 + nseg
+        for _, l in ipairs(lace) do
+            cur[#cur + 1] = data:sub(dpos, dpos + l - 1)
+            dpos += l
+            if l < 255 then
+                packets[#packets + 1] = table.concat(cur)
+                cur = {}
+                if #packets >= want then break end
+            end
+        end
+        pos = dpos
+    end
+    return packets
+end
+
+local function parseOgg(data)
+    local info = {}
+    local pkt = oggPackets(data, 2)[2]
+    if not pkt then return info end
+
+    local offset
+    if pkt:sub(1, 7) == "\3vorbis" then
+        offset = 8
+    elseif pkt:sub(1, 8) == "OpusTags" then
+        offset = 9
+    else
+        return info
+    end
+
+    local p = offset
+    local vlen = u32le(pkt, p); p += 4 + vlen
+    local count = u32le(pkt, p); p += 4
+    local tags = {}
+    for _ = 1, count do
+        if p + 4 > #pkt then break end
+        local len = u32le(pkt, p); p += 4
+        local s = pkt:sub(p, p + len - 1); p += len
+        local eq = s:find("=", 1, true)
+        if eq then
+            local k = s:sub(1, eq - 1):upper()
+            if not tags[k] then tags[k] = s:sub(eq + 1) end
+        end
+    end
+
+    local function clean(v)
+        if not v then return nil end
+        v = trim(v)
+        if v == "" then return nil end
+        if not utf8.len(v) then v = latin1(v) end
+        return v
+    end
+
+    info.title = clean(tags.TITLE)
+    info.artist = clean(tags.ARTIST)
+    info.album = clean(tags.ALBUM)
+
+    if tags.METADATA_BLOCK_PICTURE then
+        local ok, img = pcall(function()
+            return parseFlacPicture(b64decode(tags.METADATA_BLOCK_PICTURE))
+        end)
+        if ok and img and #img > 0 then info.image = img end
+    end
+    return info
+end
+
+-- =====================================================================
+--  FILE SYSTEM / LIBRARY
+-- =====================================================================
+local songs = {}      -- sorted array of song tables
+local known = {}      -- [fileName] = song
+local cacheIndex = {} -- [fileName] = { title, artist, album, cover }
+
+local function safeName(s)
+    return (s:gsub("[^%w_%-]", "_"))
+end
+
+local function loadIndex()
+    cacheIndex = {}
+    if fsOk and isfile(INDEX) then
+        local ok, res = pcall(function() return HttpService:JSONDecode(readfile(INDEX)) end)
+        if ok and type(res) == "table" then cacheIndex = res end
+    end
+end
+
+local function saveIndex()
+    if not fsOk then return end
+    pcall(function() writefile(INDEX, HttpService:JSONEncode(cacheIndex)) end)
+end
+
+local function readMeta(fileName)
+    local path = ROOT .. "/" .. fileName
+    local ext = (fileName:match("%.([^%.]+)$") or ""):lower()
+    local meta = {}
+
+    local ok, data = pcall(readfile, path)
+    if ok and type(data) == "string" then
+        local ok2, res = pcall(function()
+            if ext == "mp3" then
+                local m = parseID3(data)
+                if not m.title and data:sub(-128, -126) == "TAG" then
+                    local t = trim(latin1(cutNull(data:sub(-125, -96))))
+                    local a = trim(latin1(cutNull(data:sub(-95, -66))))
+                    if t ~= "" then m.title = t end
+                    if a ~= "" then m.artist = m.artist or a end
+                end
+                return m
+            elseif ext == "ogg" then
+                return parseOgg(data)
+            end
+            return {}
+        end)
+        if ok2 and type(res) == "table" then meta = res end
+    end
+    data = nil
+
+    -- cover -> cache folder
+    local coverPath
+    if meta.image then
+        local e = imgExt(meta.image)
+        if e then
+            coverPath = CACHE .. "/" .. safeName(fileName) .. "." .. e
+            local okW = pcall(writefile, coverPath, meta.image)
+            if not okW then coverPath = nil end
+        end
+    end
+
+    -- name fallbacks
+    local base = (fileName:gsub("%.[^%.]+$", ""))
+    local title, artist = meta.title, meta.artist
+    if not title then
+        local a, t = base:match("^(.-)%s+%-%s+(.+)$")
+        if a and t then
+            title = t
+            artist = artist or a
+        else
+            title = base
+        end
+    end
+
+    return {
+        title = title,
+        artist = artist or "Unknown Artist",
+        album = meta.album,
+        cover = coverPath,
+    }
+end
+
+local function loadSong(fileName)
+    local entry = cacheIndex[fileName]
+    if not (entry and (not entry.cover or isfile(entry.cover))) then
+        entry = readMeta(fileName)
+        cacheIndex[fileName] = entry
+        saveIndex()
+    end
+    return {
+        file = fileName,
+        path = ROOT .. "/" .. fileName,
+        title = entry.title or fileName,
+        artist = entry.artist or "Unknown Artist",
+        album = entry.album,
+        cover = entry.cover,
+    }
+end
+
+local function listAudioFiles()
+    local files = {}
+    local ok, list = pcall(listfiles, ROOT)
+    if ok and type(list) == "table" then
+        for _, p in ipairs(list) do
+            local name = p:match("[^/\\]+$")
+            local ext = name and name:match("%.([^%.]+)$")
+            if ext then
+                ext = ext:lower()
+                if ext == "mp3" or ext == "ogg" or ext == "wav" then
+                    files[name] = true
+                end
+            end
+        end
+    end
+    return files
+end
+
+if fsOk then
+    pcall(function()
+        if not isfolder(ROOT) then makefolder(ROOT) end
+        if not isfolder(CACHE) then makefolder(CACHE) end
+    end)
+    loadIndex()
+end
+
+-- ========= ScreenGui =========
+local gui = create("ScreenGui", {
+    Name = "Musix",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    IgnoreGuiInset = true,
+    DisplayOrder = 999,
+})
+
+-- Cover the real full screen (notch / cutout areas included), not just the "safe" area
+pcall(function() gui.ScreenInsets = Enum.ScreenInsets.None end)
+
+-- Full-screen mode shifts the coordinate origin to the physical screen corner, but the
+-- Roblox topbar icons still sit inside the safe area. Measure that offset so the pill lines up.
+local safeOffset = Vector2.zero
+pcall(function()
+    local probeGui = Instance.new("ScreenGui")
+    probeGui.IgnoreGuiInset = true
+    probeGui.ScreenInsets = Enum.ScreenInsets.CoreUISafe
+    local probe = Instance.new("Frame")
+    probe.Size = UDim2.fromOffset(1, 1)
+    probe.BackgroundTransparency = 1
+    probe.Parent = probeGui
+    probeGui.Parent = parent
+    task.wait()
+    task.wait()
+    safeOffset = probe.AbsolutePosition
+    probeGui:Destroy()
+end)
+
+-- Blur behind the window
+local blur = create("BlurEffect", { Name = "MusixBlur", Size = 0 })
+blur.Parent = Lighting
+
+-- ========= Window (fullscreen, 85% opacity) =========
+local window = create("CanvasGroup", {
+    Name = "Window",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = Theme.Background,
+    BackgroundTransparency = WINDOW_TRANSPARENCY,
+    BorderSizePixel = 0,
+    Active = true,
+    GroupTransparency = 1, -- faded in by the intro animation
+})
+local windowScale = create("UIScale", { Scale = 0.94 })
+windowScale.Parent = window
+window.Parent = gui
+
+local header = create("Frame", {
+    Name = "Header",
+    Position = UDim2.fromOffset(14, 8),
+    Size = UDim2.new(1, -28, 0, 34),
+    BackgroundTransparency = 1,
+})
+header.Parent = window
+
+create("TextLabel", {
+    Name = "Title",
+    BackgroundTransparency = 1,
+    Size = UDim2.new(0, 140, 1, 0),
+    Font = Enum.Font.GothamBold,
+    Text = "Musix",
+    TextColor3 = Theme.Accent,
+    TextSize = 22,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = header,
+})
+
+local function headerButton(name, text, offsetFromRight)
+    local btn = create("TextButton", {
+        Name = name,
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -offsetFromRight, 0.5, 0),
+        Size = UDim2.fromOffset(32, 32),
+        BackgroundColor3 = Theme.Element,
+        BackgroundTransparency = 0.2,
+        Text = text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 16,
+        TextColor3 = Theme.Text,
+        AutoButtonColor = false,
+    }, { corner(UDim.new(1, 0)) })
+    btn.Parent = header
+    return btn
+end
+
+local closeBtn = headerButton("Close", "X", 0)
+local minBtn   = headerButton("Minimize", "-", 40)
+
+local content = create("Frame", {
+    Name = "Content",
+    Position = UDim2.fromOffset(14, 50),
+    Size = UDim2.new(1, -28, 1, -64),
+    BackgroundTransparency = 1,
+})
+content.Parent = window
+
+local GAP = 12
+
+-- ========= Sidebar =========
+local sidebar = create("Frame", {
+    Name = "Sidebar",
+    Size = UDim2.new(0, 220, 1, 0),
+    BackgroundColor3 = Theme.Sidebar,
+    BackgroundTransparency = 0.3,
+    BorderSizePixel = 0,
+}, { corner(UDim.new(0, 14)) })
+sidebar.Parent = content
+
+local libHeader = create("TextLabel", {
+    Name = "Header",
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(14, 10),
+    Size = UDim2.new(1, -56, 0, 24),
+    Font = Enum.Font.GothamBold,
+    Text = "Your Library",
+    TextColor3 = Theme.Text,
+    TextSize = 15,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = sidebar,
+})
+
+local refreshBtn = create("TextButton", {
+    Name = "Refresh",
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -10, 0, 10),
+    Size = UDim2.fromOffset(24, 24),
+    BackgroundColor3 = Theme.Element,
+    BackgroundTransparency = 0.2,
+    Text = "S",
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    TextColor3 = Theme.Text,
+    AutoButtonColor = false,
+}, { corner(UDim.new(1, 0)) })
+refreshBtn.Parent = sidebar
+
+local searchBox = create("TextBox", {
+    Name = "Search",
+    Position = UDim2.fromOffset(10, 42),
+    Size = UDim2.new(1, -20, 0, 30),
+    BackgroundColor3 = Theme.Element,
+    BackgroundTransparency = 0.2,
+    PlaceholderText = "Search or paste Roblox ID...",
+    PlaceholderColor3 = Theme.SubText,
+    Text = "",
+    TextColor3 = Theme.Text,
+    Font = Enum.Font.Gotham,
+    TextSize = 13,
+    ClearTextOnFocus = false,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, {
+    corner(UDim.new(0, 8)),
+    create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }),
+})
+searchBox.Parent = sidebar
+
+local songList = create("ScrollingFrame", {
+    Name = "SongList",
+    Position = UDim2.fromOffset(0, 80),
+    Size = UDim2.new(1, 0, 1, -80),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = Theme.SubText,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, {
+    create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3) }),
+    create("UIPadding", {
+        PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
+        PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 10),
+    }),
+})
+songList.Parent = sidebar
+
+local emptyLabel = create("TextLabel", {
+    Name = "Empty",
+    LayoutOrder = -1,
+    Size = UDim2.new(1, 0, 0, 110),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    TextWrapped = true,
+    TextColor3 = Theme.SubText,
+    TextSize = 13,
+    Text = "",
+})
+emptyLabel.Parent = songList
+
+-- ========= Main panel =========
+local main = create("Frame", {
+    Name = "Main",
+    BackgroundColor3 = Theme.Panel,
+    BackgroundTransparency = 0.3,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+}, {
+    corner(UDim.new(0, 14)),
+    create("UIGradient", {
+        Color = ColorSequence.new(Color3.fromRGB(70, 60, 110), Color3.fromRGB(24, 24, 30)),
+        Rotation = 90,
+    }),
+})
+main.Parent = content
+
+local function layout()
+    local w = content.AbsoluteSize.X
+    local sideW = math.clamp(math.floor(w * 0.3), 190, 320)
+    sidebar.Size = UDim2.new(0, sideW, 1, 0)
+    main.Position = UDim2.new(0, sideW + GAP, 0, 0)
+    main.Size = UDim2.new(1, -(sideW + GAP), 1, 0)
+end
+track(content:GetPropertyChangedSignal("AbsoluteSize"):Connect(layout))
+layout()
+
+local INFO_H, PLAYER_H = 50, 104
+
+local artArea = create("Frame", {
+    Name = "ArtArea",
+    Size = UDim2.new(1, 0, 1, -(INFO_H + PLAYER_H)),
+    BackgroundTransparency = 1,
+})
+artArea.Parent = main
+
+local art = create("Frame", {
+    Name = "AlbumArt",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.55),
+    Size = UDim2.fromScale(0.8, 0.8),
+    BackgroundColor3 = Theme.Element,
+    BorderSizePixel = 0,
+}, {
+    corner(UDim.new(0, 14)),
+    create("UIAspectRatioConstraint", { AspectRatio = 1 }),
+    create("UIStroke", { Color = Theme.Hover, Thickness = 1 }),
+})
+art.Parent = artArea
+
+local artScale = create("UIScale", { Scale = 1 })
+artScale.Parent = art
+
+local artNote = create("TextLabel", {
+    Name = "Note",
+    BackgroundTransparency = 1,
+    Size = UDim2.fromScale(1, 1),
+    Font = Enum.Font.GothamBold,
+    Text = "♪",
+    TextColor3 = Theme.Accent,
+    TextScaled = true,
+})
+artNote.Parent = art
+
+local artImage = create("ImageLabel", {
+    Name = "Cover",
+    BackgroundTransparency = 1,
+    Size = UDim2.fromScale(1, 1),
+    ScaleType = Enum.ScaleType.Crop,
+    Visible = false,
+}, { corner(UDim.new(0, 14)) })
+artImage.Parent = art
+
+local info = create("Frame", {
+    Name = "Info",
+    Position = UDim2.new(0, 0, 1, -(INFO_H + PLAYER_H)),
+    Size = UDim2.new(1, 0, 0, INFO_H),
+    BackgroundTransparency = 1,
+})
+info.Parent = main
+
+local songTitle = create("TextLabel", {
+    Name = "SongTitle",
+    Position = UDim2.fromOffset(20, 2),
+    Size = UDim2.new(1, -40, 0, 26),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    Text = "Nothing playing",
+    TextColor3 = Theme.Text,
+    TextSize = 20,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+songTitle.Parent = info
+
+local songArtist = create("TextLabel", {
+    Name = "SongArtist",
+    Position = UDim2.fromOffset(20, 28),
+    Size = UDim2.new(1, -40, 0, 18),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    Text = "Select a song from your library",
+    TextColor3 = Theme.SubText,
+    TextSize = 14,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+songArtist.Parent = info
+
+local player = create("Frame", {
+    Name = "Player",
+    AnchorPoint = Vector2.new(0, 1),
+    Position = UDim2.new(0, 0, 1, 0),
+    Size = UDim2.new(1, 0, 0, PLAYER_H),
+    BackgroundTransparency = 1,
+})
+player.Parent = main
+
+local timeLeft = create("TextLabel", {
+    Name = "TimeCurrent",
+    Position = UDim2.fromOffset(14, 4),
+    Size = UDim2.fromOffset(40, 16),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    Text = "0:00",
+    TextColor3 = Theme.SubText,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Right,
+})
+timeLeft.Parent = player
+
+local timeRight = create("TextLabel", {
+    Name = "TimeRemaining",
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -14, 0, 4),
+    Size = UDim2.fromOffset(44, 16),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    Text = "-0:00",
+    TextColor3 = Theme.SubText,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+})
+timeRight.Parent = player
+
+local barBack = create("Frame", {
+    Name = "ProgressBack",
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 60, 0, 12),
+    Size = UDim2.new(1, -124, 0, 5),
+    BackgroundColor3 = Theme.Element,
+    BorderSizePixel = 0,
+}, { corner(UDim.new(1, 0)) })
+barBack.Parent = player
+
+local barFill = create("Frame", {
+    Name = "Fill",
+    Size = UDim2.fromScale(0, 1),
+    BackgroundColor3 = Theme.Text,
+    BorderSizePixel = 0,
+}, { corner(UDim.new(1, 0)) })
+barFill.Parent = barBack
+
+local barKnob = create("Frame", {
+    Name = "Knob",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0, 0.5),
+    Size = UDim2.fromOffset(12, 12),
+    BackgroundColor3 = Theme.Text,
+    BorderSizePixel = 0,
+}, { corner(UDim.new(1, 0)) })
+barKnob.Parent = barBack
+
+local barHit = create("TextButton", {
+    Name = "ProgressHit",
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 60, 0, 12),
+    Size = UDim2.new(1, -124, 0, 24),
+    BackgroundTransparency = 1,
+    Text = "",
+})
+barHit.Parent = player
+
+local controls = create("Frame", {
+    Name = "Controls",
+    AnchorPoint = Vector2.new(0.5, 0),
+    Position = UDim2.new(0.5, 0, 0, 28),
+    Size = UDim2.new(1, -40, 0, 46),
+    BackgroundTransparency = 1,
+}, {
+    create("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        Padding = UDim.new(0, 14),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }),
+})
+controls.Parent = player
+
+local function controlButton(name, text, order, size, bg, fg, textSize)
+    local btn = create("TextButton", {
+        Name = name,
+        LayoutOrder = order,
+        Size = UDim2.fromOffset(size, size),
+        BackgroundColor3 = bg or Theme.Element,
+        BackgroundTransparency = bg and 0 or 0.2,
+        Text = text,
+        Font = Enum.Font.GothamBold,
+        TextSize = textSize or 14,
+        TextColor3 = fg or Theme.Text,
+        AutoButtonColor = false,
+    }, { corner(UDim.new(1, 0)) })
+    btn.Parent = controls
+    return btn
+end
+
+local shuffleBtn = controlButton("Shuffle",   "SH", 1, 34, nil, nil, 12)
+local prevBtn    = controlButton("Previous",  "<<", 2, 38, nil, nil, 15)
+local playBtn    = controlButton("PlayPause", ">",  3, 46, Theme.Text, Theme.Sidebar, 20)
+local nextBtn    = controlButton("Next",      ">>", 4, 38, nil, nil, 15)
+local repeatBtn  = controlButton("Repeat",    "RP", 5, 34, nil, nil, 12)
+
+create("TextLabel", {
+    Name = "VolLabel",
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 16, 1, -14),
+    Size = UDim2.fromOffset(34, 16),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    Text = "VOL",
+    TextColor3 = Theme.SubText,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = player,
+})
+
+local volBack = create("Frame", {
+    Name = "VolumeBack",
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 54, 1, -14),
+    Size = UDim2.new(0, 130, 0, 5),
+    BackgroundColor3 = Theme.Element,
+    BorderSizePixel = 0,
+}, { corner(UDim.new(1, 0)) })
+volBack.Parent = player
+
+local volFill = create("Frame", {
+    Name = "Fill",
+    Size = UDim2.fromScale(0.5, 1),
+    BackgroundColor3 = Theme.Text,
+    BorderSizePixel = 0,
+}, { corner(UDim.new(1, 0)) })
+volFill.Parent = volBack
+
+local volKnob = create("Frame", {
+    Name = "Knob",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(12, 12),
+    BackgroundColor3 = Theme.Text,
+    BorderSizePixel = 0,
+}, { corner(UDim.new(1, 0)) })
+volKnob.Parent = volBack
+
+local volHit = create("TextButton", {
+    Name = "VolumeHit",
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 54, 1, -14),
+    Size = UDim2.new(0, 130, 0, 24),
+    BackgroundTransparency = 1,
+    Text = "",
+})
+volHit.Parent = player
+
+-- ========= Minimized pill (solid, fits the topbar height) =========
+local inset = GuiService:GetGuiInset()
+local pillH = math.clamp(inset.Y - 14, 30, 44)
+local pillY = math.floor((inset.Y - pillH) / 2)
+local pillBtn = pillH - 10
+
+-- Current pill placement (x = left edge, w = width, cy = vertical center), updated by updatePillLayout()
+local pillLayout = {
+    x = safeOffset.X + PILL_X,
+    w = PILL_WIDTH,
+    cy = safeOffset.Y + pillY + PILL_Y_OFFSET + pillH / 2,
+}
+
+local function getPillCenter()
+    return UDim2.fromOffset(pillLayout.x + pillLayout.w / 2, pillLayout.cy)
+end
+
+local pill = create("Frame", {
+    Name = "Pill",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = getPillCenter(),
+    Size = UDim2.fromOffset(PILL_WIDTH, pillH),
+    BackgroundColor3 = Theme.Topbar,
+    BackgroundTransparency = 0,
+    BorderSizePixel = 0,
+    Visible = false,
+}, { corner(UDim.new(1, 0)) })
+local pillScale = create("UIScale", { Scale = 1 })
+pillScale.Parent = pill
+pill.Parent = gui
+
+create("TextLabel", {
+    Name = "Note",
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(12, 0),
+    Size = UDim2.new(0, 18, 1, 0),
+    Font = Enum.Font.GothamBold,
+    Text = "♪",
+    TextColor3 = Theme.Accent,
+    TextSize = 18,
+    Parent = pill,
+})
+
+local pillTitle = create("TextLabel", {
+    Name = "Title",
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(34, 0),
+    Size = UDim2.new(1, -(34 + 5 + pillBtn + 4 + 46 + 4), 1, 0),
+    Font = Enum.Font.GothamMedium,
+    Text = "Musix",
+    TextColor3 = Theme.Text,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+pillTitle.Parent = pill
+
+local pillTime = create("TextLabel", {
+    Name = "TimeLeft",
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -(5 + pillBtn + 4), 0, 0),
+    Size = UDim2.new(0, 46, 1, 0),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamMedium,
+    Text = "-0:00",
+    TextColor3 = Theme.SubText,
+    TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Right,
+})
+pillTime.Parent = pill
+
+local pillOpen = create("TextButton", {
+    Name = "Open",
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, -(pillBtn + 10), 1, 0),
+    Text = "",
+})
+pillOpen.Parent = pill
+
+local pillPlay = create("TextButton", {
+    Name = "PlayPause",
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -5, 0.5, 0),
+    Size = UDim2.fromOffset(pillBtn, pillBtn),
+    BackgroundColor3 = Theme.Text,
+    Text = ">",
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextColor3 = Theme.Sidebar,
+    AutoButtonColor = false,
+}, { corner(UDim.new(1, 0)) })
+pillPlay.Parent = pill
+
+-- ---- Auto-placement: sit right after whatever buttons the topbar currently has ----
+-- Looks at Roblox's own topbar (CoreGui.TopBarApp) and at the game's GUIs (e.g. TopbarPlus
+-- buttons the creator added), finds the right-most button in the left half of the topbar
+-- and parks the pill just after it. Re-checked every second while the pill is showing.
+local function isShown(obj)
+    local cur = obj
+    while cur and cur ~= game do
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        if cur:IsA("ScreenGui") and not cur.Enabled then return false end
+        cur = cur.Parent
+    end
+    return true
+end
+
+local function looksDrawn(d)
+    if d.BackgroundTransparency < 0.98 then return true end
+    if d:IsA("ImageLabel") or d:IsA("ImageButton") then
+        return d.Image ~= "" and d.ImageTransparency < 0.98
+    end
+    if d:IsA("TextLabel") or d:IsA("TextButton") then
+        return d.Text ~= "" and d.TextTransparency < 0.98
+    end
+    return false
+end
+
+local function scanTopbar()
+    local cam = workspace.CurrentCamera
+    local screenW = (cam and cam.ViewportSize.X) or 800
+    local topY = GuiService:GetGuiInset().Y
+
+    local roots = {}
+    local okc, core = pcall(function() return game:GetService("CoreGui") end)
+    if okc and core then
+        local tb = core:FindFirstChild("TopBarApp")
+        if tb then roots[#roots + 1] = tb end
+    end
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        for _, g in ipairs(pg:GetChildren()) do
+            if g:IsA("ScreenGui") and g ~= gui and g.Enabled then
+                roots[#roots + 1] = g
+            end
+        end
+    end
+
+    local leftEnd, leftCy, rightStart
+    for _, root in ipairs(roots) do
+        for _, d in ipairs(root:GetDescendants()) do
+            if d:IsA("GuiObject") then
+                local size = d.AbsoluteSize
+                if size.X >= 20 and size.X <= 400 and size.Y >= 26 and size.Y <= 60 then
+                    local pos = d.AbsolutePosition
+                    local cy = pos.Y + size.Y / 2
+                    if cy > 8 and cy < topY and looksDrawn(d) and isShown(d) then
+                        if pos.X + size.X / 2 < screenW * 0.5 then
+                            local e = pos.X + size.X
+                            if not leftEnd or e > leftEnd then
+                                leftEnd, leftCy = e, cy
+                            end
+                        elseif not rightStart or pos.X < rightStart then
+                            rightStart = pos.X
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return { leftEnd = leftEnd, leftCy = leftCy, rightStart = rightStart }
+end
+
+local function updatePillLayout(animate)
+    if not AUTO_PILL then return end
+    local ok, r = pcall(scanTopbar)
+    if not ok or type(r) ~= "table" then return end
+
+    local x = r.leftEnd and math.floor(r.leftEnd + PILL_GAP) or (safeOffset.X + PILL_X)
+    local w = PILL_WIDTH
+    if r.rightStart then
+        -- squeeze the pill if the right-hand buttons are close
+        w = math.clamp(math.floor(r.rightStart - 10 - x), 150, PILL_WIDTH)
+    end
+    local cy = r.leftCy and math.floor(r.leftCy)
+        or (safeOffset.Y + pillY + PILL_Y_OFFSET + pillH / 2)
+
+    if x == pillLayout.x and w == pillLayout.w and cy == pillLayout.cy then return end
+    pillLayout.x, pillLayout.w, pillLayout.cy = x, w, cy
+
+    local goalPos = getPillCenter()
+    local goalSize = UDim2.fromOffset(w, pillH)
+    if animate and pill.Visible then
+        tweenEx(pill, 0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out, {
+            Position = goalPos,
+            Size = goalSize,
+        })
+    else
+        pill.Position = goalPos
+        pill.Size = goalSize
+    end
+end
+
+-- =====================================================================
+--  AUDIO
+-- =====================================================================
+local sound = create("Sound", { Name = "MusixSound", Volume = 0.5 })
+sound.Parent = SoundService
+
+local currentSong = nil
+local isPlaying = false
+local shuffleOn, repeatOn = false, false
+local switching = false
+
+local rows = {}          -- playlist (Musix folder) rows
+local webRows = {}       -- Roblox search result rows
+local searchMode = "playlist" -- "playlist" or "roblox"
+
+local function coverAsset(song)
+    if song.coverAsset == nil then
+        song.coverAsset = false
+        if song.cover and assetFn then
+            local ok, a = pcall(assetFn, song.cover)
+            if ok and a then song.coverAsset = a end
+        end
+    end
+    return song.coverAsset or nil
+end
+
+local function refreshPlayIcon()
+    local txt = isPlaying and "II" or ">"
+    playBtn.Text = txt
+    pillPlay.Text = txt
+end
+
+local function highlightRows()
+    for _, row in ipairs(rows) do
+        local active = (row.song == currentSong)
+        tween(row.frame, 0.25, { BackgroundTransparency = active and 0.3 or 1 })
+        tween(row.title, 0.25, { TextColor3 = active and Theme.Accent or Theme.Text })
+    end
+    for _, row in ipairs(webRows) do
+        local active = currentSong ~= nil and currentSong.assetId ~= nil
+            and currentSong.assetId == row.song.assetId
+        tween(row.frame, 0.25, { BackgroundTransparency = active and 0.3 or 1 })
+        tween(row.title, 0.25, { TextColor3 = active and Theme.Accent or Theme.Text })
+    end
+end
+
+local function updateNowPlayingUI()
+    if currentSong then
+        songTitle.Text = currentSong.title
+        songArtist.Text = currentSong.artist .. (currentSong.album and (" - " .. currentSong.album) or "")
+        pillTitle.Text = currentSong.title .. " - " .. currentSong.artist
+        local c = coverAsset(currentSong)
+        if c then
+            artImage.Image = c
+            artImage.Visible = true
+            artNote.Visible = false
+        else
+            artImage.Visible = false
+            artNote.Visible = true
+        end
+    else
+        songTitle.Text = "Nothing playing"
+        songArtist.Text = "Select a song from your library"
+        pillTitle.Text = "Musix"
+        artImage.Visible = false
+        artNote.Visible = true
+        timeLeft.Text = "0:00"
+        timeRight.Text = "-0:00"
+        pillTime.Text = "-0:00"
+        barFill.Size = UDim2.fromScale(0, 1)
+        barKnob.Position = UDim2.fromScale(0, 0.5)
+    end
+    refreshPlayIcon()
+    highlightRows()
+end
+
+-- Pop + fade whenever the track changes
+local function animateSongChange()
+    artScale.Scale = 0.86
+    tweenEx(artScale, 0.55, Enum.EasingStyle.Back, Enum.EasingDirection.Out, { Scale = 1 })
+
+    artImage.ImageTransparency = 1
+    tweenEx(artImage, 0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, { ImageTransparency = 0 })
+
+    songTitle.TextTransparency = 1
+    songArtist.TextTransparency = 1
+    pillTitle.TextTransparency = 1
+    tweenEx(songTitle, 0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, { TextTransparency = 0 })
+    tweenEx(songArtist, 0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, { TextTransparency = 0 })
+    tweenEx(pillTitle, 0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, { TextTransparency = 0 })
+end
+
+local function playSong(song)
+    local asset
+    if song.assetId then
+        -- Roblox audio asset (played straight from the ID, no file needed)
+        asset = "rbxassetid://" .. song.assetId
+    else
+        if not assetFn then
+            songArtist.Text = "Your executor has no getcustomasset support"
+            return
+        end
+        local ok, a = pcall(assetFn, song.path)
+        if not ok or not a then
+            songArtist.Text = "Couldn't load that file"
+            return
+        end
+        asset = a
+    end
+    currentSong = song
+    switching = true
+    sound:Stop()
+    sound.SoundId = asset
+    sound.TimePosition = 0
+    sound.Looped = repeatOn
+    sound:Play()
+    isPlaying = true
+    task.delay(0.3, function() switching = false end)
+    updateNowPlayingUI()
+    animateSongChange()
+
+    if song.assetId then
+        task.delay(4, function()
+            if alive and currentSong == song and not sound.IsLoaded then
+                songArtist.Text = "Couldn't load that ID (private, or not allowed in this game)"
+            end
+        end)
+    end
+end
+
+local function indexOfCurrent()
+    for i, s in ipairs(songs) do
+        if s == currentSong then return i end
+    end
+    return nil
+end
+
+local function playNext()
+    if #songs == 0 then return end
+    local i = indexOfCurrent()
+    local target
+    if shuffleOn and #songs > 1 then
+        repeat target = math.random(1, #songs) until target ~= i
+    else
+        target = i and (i % #songs + 1) or 1
+    end
+    playSong(songs[target])
+end
+
+local function playPrevious()
+    if #songs == 0 then return end
+    if currentSong and sound.TimePosition > 3 then
+        sound.TimePosition = 0
+        return
+    end
+    local i = indexOfCurrent() or 1
+    playSong(songs[i > 1 and i - 1 or #songs])
+end
+
+local function togglePlay()
+    if not currentSong then
+        if #songs > 0 then playSong(songs[1]) end
+        return
+    end
+    if isPlaying then
+        sound:Pause()
+        isPlaying = false
+    else
+        if sound.IsPaused then sound:Resume() else sound:Play() end
+        isPlaying = true
+    end
+    refreshPlayIcon()
+end
+
+track(sound.Ended:Connect(function()
+    if switching or not alive then return end
+    playNext()
+end))
+
+-- =====================================================================
+--  SONG LIST UI
+-- =====================================================================
+-- ---- Roblox song ID row: appears when the search box holds an audio ID ----
+local idInfoCache = {}
+local currentIdQuery = nil
+
+local idRow = create("TextButton", {
+    Name = "RobloxId",
+    LayoutOrder = -2,
+    Size = UDim2.new(1, 0, 0, 52),
+    BackgroundColor3 = Theme.Accent,
+    BackgroundTransparency = 0.75,
+    AutoButtonColor = false,
+    Text = "",
+    Visible = false,
+}, { corner(UDim.new(0, 8)) })
+idRow.Parent = songList
+
+local idTitle = create("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(10, 7),
+    Size = UDim2.new(1, -20, 0, 20),
+    Font = Enum.Font.GothamMedium,
+    Text = "",
+    TextColor3 = Theme.Text,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    Parent = idRow,
+})
+
+local idSub = create("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(10, 27),
+    Size = UDim2.new(1, -20, 0, 16),
+    Font = Enum.Font.Gotham,
+    Text = "",
+    TextColor3 = Theme.SubText,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    Parent = idRow,
+})
+
+local function parseId(text)
+    local t = trim(text)
+    return t:match("^rbxassetid://(%d+)$")
+        or t:match("^(%d+)$")
+        or t:match("/asset/(%d+)")
+        or t:match("[?&]id=(%d+)")
+end
+
+local function updateIdRow(id)
+    local info = idInfoCache[id]
+    if info and not info.failed then
+        idTitle.Text = info.Name or ("Roblox ID " .. id)
+        if info.AssetTypeId ~= 3 then
+            idSub.Text = "Not an audio asset"
+        else
+            local by = info.Creator and info.Creator.Name or "Unknown"
+            idSub.Text = by .. "  -  Roblox ID " .. id
+        end
+    elseif info and info.failed then
+        idTitle.Text = "Roblox ID " .. id
+        idSub.Text = "Tap to try playing it"
+    else
+        idTitle.Text = "Roblox ID " .. id
+        idSub.Text = "Looking up..."
+    end
+end
+
+local function fetchIdInfo(id)
+    if idInfoCache[id] ~= nil then return end
+    idInfoCache[id] = false
+    task.spawn(function()
+        local ok, info = pcall(function()
+            return MarketplaceService:GetProductInfo(tonumber(id))
+        end)
+        idInfoCache[id] = (ok and type(info) == "table") and info or { failed = true }
+        if alive and currentIdQuery == id then updateIdRow(id) end
+    end)
+end
+
+local function playId(id)
+    local info = idInfoCache[id]
+    local good = info and not info.failed
+    if good and info.AssetTypeId ~= 3 then return end -- not audio
+    playSong({
+        file = "id:" .. id,
+        assetId = id,
+        title = (good and info.Name) or ("Roblox ID " .. id),
+        artist = (good and info.Creator and info.Creator.Name) or "Roblox",
+    })
+end
+
+idRow.MouseButton1Click:Connect(function()
+    if currentIdQuery then playId(currentIdQuery) end
+end)
+
+searchBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed and currentIdQuery then playId(currentIdQuery) end
+end)
+
+-- ---- "Songs on Roblox" mode (S button): search Roblox audio by name ----
+local httpRequest = request or http_request or (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request)
+
+local function httpGetJson(path)
+    if not httpRequest then return nil, "your executor has no request function" end
+    local lastErr = "unknown error"
+    -- Roblox first; the roproxy mirror is only a fallback if Roblox refuses the request
+    for _, host in ipairs({ "https://apis.roblox.com", "https://apis.roproxy.com" }) do
+        local ok, res = pcall(httpRequest, {
+            Url = host .. path,
+            Method = "GET",
+            Headers = { ["Accept"] = "application/json" },
+        })
+        if ok and type(res) == "table" then
+            if res.StatusCode == 200 and res.Body then
+                local okJ, data = pcall(function() return HttpService:JSONDecode(res.Body) end)
+                if okJ and type(data) == "table" then return data end
+                lastErr = "bad response"
+            else
+                lastErr = "HTTP " .. tostring(res.StatusCode)
+            end
+        else
+            lastErr = "request blocked"
+        end
+    end
+    return nil, lastErr
+end
+
+local function searchRobloxAudio(query)
+    local data, err = httpGetJson(
+        "/toolbox-service/v1/marketplace/3?keyword=" .. HttpService:UrlEncode(query) .. "&num=25"
+    )
+    if not data then return nil, err end
+    if type(data.data) ~= "table" then return {} end
+
+    local order = {}
+    for _, item in ipairs(data.data) do
+        local rawId = item.id or (type(item.asset) == "table" and item.asset.id)
+        if type(rawId) == "number" then
+            order[#order + 1] = string.format("%d", rawId)
+        end
+    end
+    if #order == 0 then return {} end
+
+    local det = httpGetJson("/toolbox-service/v1/items/details?assetIds=" .. table.concat(order, "%2C"))
+    local byId = {}
+    if det and type(det.data) == "table" then
+        for _, item in ipairs(det.data) do
+            local asset = type(item.asset) == "table" and item.asset or item
+            if type(asset.id) == "number" then
+                byId[string.format("%d", asset.id)] = { asset = asset, creator = item.creator }
+            end
+        end
+    end
+
+    local results = {}
+    for _, id in ipairs(order) do
+        local title, artist, duration = "Roblox ID " .. id, "Unknown", nil
+        local skip = false
+        local entry = byId[id]
+        if entry then
+            local a = entry.asset
+            if a.typeId and a.typeId ~= 3 then skip = true end
+            local audio = type(a.audioDetails) == "table" and a.audioDetails or {}
+            if a.name and a.name ~= "" then
+                title = a.name
+            elseif audio.title and audio.title ~= "" then
+                title = audio.title
+            end
+            if title:find("Content Deleted", 1, true) then skip = true end
+            local by = type(entry.creator) == "table" and entry.creator.name or nil
+            if audio.artist and audio.artist ~= "" then
+                artist = audio.artist
+            elseif by then
+                artist = by
+            end
+            duration = tonumber(audio.duration)
+        end
+        if not skip then
+            results[#results + 1] = { id = id, title = title, artist = artist, duration = duration }
+        end
+    end
+    return results
+end
+
+local webStatus = create("TextLabel", {
+    Name = "WebStatus",
+    LayoutOrder = 500,
+    Size = UDim2.new(1, 0, 0, 100),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    TextWrapped = true,
+    TextColor3 = Theme.SubText,
+    TextSize = 13,
+    Text = "",
+    Visible = false,
+})
+webStatus.Parent = songList
+
+local function setWebStatus(text)
+    webStatus.Text = text
+    webStatus.Visible = (searchMode == "roblox") and text ~= ""
+end
+
+local function clearWebRows()
+    for _, row in ipairs(webRows) do row.frame:Destroy() end
+    webRows = {}
+end
+
+local function renderWebResults(results)
+    clearWebRows()
+    for i, r in ipairs(results) do
+        local song = {
+            file = "id:" .. r.id,
+            assetId = r.id,
+            title = r.title,
+            artist = r.artist,
+        }
+
+        local frame = create("TextButton", {
+            Name = "Web_" .. i,
+            LayoutOrder = 1000 + i,
+            Size = UDim2.new(1, 0, 0, 52),
+            BackgroundColor3 = Theme.Element,
+            BackgroundTransparency = 1,
+            AutoButtonColor = false,
+            Text = "",
+            Visible = (searchMode == "roblox"),
+        }, { corner(UDim.new(0, 8)) })
+
+        local thumb = create("Frame", {
+            Position = UDim2.fromOffset(8, 8),
+            Size = UDim2.fromOffset(36, 36),
+            BackgroundColor3 = Theme.Element,
+            BorderSizePixel = 0,
+            Parent = frame,
+        }, { corner(UDim.new(0, 6)) })
+        create("TextLabel", {
+            BackgroundTransparency = 1,
+            Size = UDim2.fromScale(1, 1),
+            Font = Enum.Font.GothamBold,
+            Text = "♪",
+            TextColor3 = Theme.Accent,
+            TextSize = 16,
+            Parent = thumb,
+        })
+
+        local title = create("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(52, 7),
+            Size = UDim2.new(1, -60, 0, 20),
+            Font = Enum.Font.GothamMedium,
+            Text = r.title,
+            TextColor3 = Theme.Text,
+            TextSize = 14,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            Parent = frame,
+        })
+
+        local sub = r.artist
+        if r.duration then sub = sub .. "  -  " .. fmtTime(r.duration) end
+        create("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(52, 27),
+            Size = UDim2.new(1, -60, 0, 16),
+            Font = Enum.Font.Gotham,
+            Text = sub,
+            TextColor3 = Theme.SubText,
+            TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            Parent = frame,
+        })
+
+        frame.MouseButton1Click:Connect(function()
+            playSong(song)
+        end)
+
+        frame.Parent = songList
+        webRows[#webRows + 1] = { frame = frame, title = title, song = song }
+    end
+    highlightRows()
+end
+
+local searchToken = 0
+
+local function doWebSearch(q, token)
+    task.spawn(function()
+        local results, err = searchRobloxAudio(q)
+        if not alive or token ~= searchToken then return end
+        if not results then
+            clearWebRows()
+            setWebStatus("Couldn't reach Roblox search (" .. tostring(err) .. ").\n\nPasting a song ID still works.")
+        elseif #results == 0 then
+            clearWebRows()
+            setWebStatus("No audio found for \"" .. q .. "\".")
+        else
+            setWebStatus("")
+            renderWebResults(results)
+        end
+    end)
+end
+
+-- Typing in Roblox mode searches after a short pause
+local function scheduleWebSearch()
+    if searchMode ~= "roblox" then return end
+    searchToken += 1
+    local token = searchToken
+    local q = trim(searchBox.Text)
+    if q == "" then
+        clearWebRows()
+        setWebStatus("Search Roblox audio by name.\n\nYou can also paste a song ID.")
+        return
+    end
+    if parseId(q) then
+        clearWebRows()
+        setWebStatus("")
+        return
+    end
+    setWebStatus("Searching...")
+    task.delay(0.7, function()
+        if not alive or token ~= searchToken then return end
+        doWebSearch(q, token)
+    end)
+end
+track(searchBox:GetPropertyChangedSignal("Text"):Connect(scheduleWebSearch))
+
+-- Enter searches right away
+searchBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed and searchMode == "roblox" and not currentIdQuery then
+        local q = trim(searchBox.Text)
+        if q ~= "" then
+            searchToken += 1
+            setWebStatus("Searching...")
+            doWebSearch(q, searchToken)
+        end
+    end
+end)
+
+local applyFilter -- forward declaration (defined just below)
+
+local function setMode(mode)
+    searchMode = mode
+    searchToken += 1
+    local roblox = (mode == "roblox")
+    libHeader.Text = roblox and "Roblox Audio" or "Your Library"
+    searchBox.PlaceholderText = roblox and "Search Roblox audio..." or "Search or paste Roblox ID..."
+    tween(refreshBtn, 0.25, {
+        BackgroundColor3 = roblox and Theme.Accent or Theme.Element,
+        TextColor3 = roblox and Theme.Sidebar or Theme.Text,
+    })
+    applyFilter()
+    if roblox then
+        scheduleWebSearch()
+    else
+        setWebStatus("")
+    end
+end
+
+function applyFilter()
+    local text = searchBox.Text
+    local id = parseId(text)
+    currentIdQuery = id
+    if id then
+        idRow.Visible = true
+        updateIdRow(id)
+        fetchIdInfo(id)
+    else
+        idRow.Visible = false
+    end
+
+    local inRoblox = (searchMode == "roblox")
+    local q = text:lower()
+    for _, row in ipairs(rows) do
+        local s = row.song
+        row.frame.Visible = (not inRoblox) and (
+            (q == "")
+            or s.title:lower():find(q, 1, true) ~= nil
+            or s.artist:lower():find(q, 1, true) ~= nil
+        )
+    end
+    emptyLabel.Visible = (not inRoblox) and (#songs == 0)
+    webStatus.Visible = inRoblox and webStatus.Text ~= ""
+    for _, row in ipairs(webRows) do
+        row.frame.Visible = inRoblox
+    end
+end
+
+local function renderList()
+    for _, row in ipairs(rows) do row.frame:Destroy() end
+    rows = {}
+
+    if #songs == 0 then
+        emptyLabel.Visible = true
+        if not fsOk then
+            emptyLabel.Text = "Your executor doesn't support the file functions Musix needs."
+        else
+            emptyLabel.Text = "No songs yet.\n\nDrop .mp3, .ogg or .wav files into the \"" .. ROOT .. "\" folder in your executor's workspace."
+        end
+    else
+        emptyLabel.Visible = false
+    end
+
+    for i, song in ipairs(songs) do
+        local frame = create("TextButton", {
+            Name = "Song_" .. i,
+            LayoutOrder = i,
+            Size = UDim2.new(1, 0, 0, 52),
+            BackgroundColor3 = Theme.Element,
+            BackgroundTransparency = 1,
+            AutoButtonColor = false,
+            Text = "",
+        }, { corner(UDim.new(0, 8)) })
+
+        local thumb = create("Frame", {
+            Name = "Thumb",
+            Position = UDim2.fromOffset(8, 8),
+            Size = UDim2.fromOffset(36, 36),
+            BackgroundColor3 = Theme.Element,
+            BorderSizePixel = 0,
+        }, { corner(UDim.new(0, 6)) })
+        thumb.Parent = frame
+
+        local c = coverAsset(song)
+        if c then
+            create("ImageLabel", {
+                BackgroundTransparency = 1,
+                Size = UDim2.fromScale(1, 1),
+                Image = c,
+                ScaleType = Enum.ScaleType.Crop,
+                Parent = thumb,
+            }, { corner(UDim.new(0, 6)) })
+        else
+            create("TextLabel", {
+                BackgroundTransparency = 1,
+                Size = UDim2.fromScale(1, 1),
+                Font = Enum.Font.GothamBold,
+                Text = "♪",
+                TextColor3 = Theme.Accent,
+                TextSize = 16,
+                Parent = thumb,
+            })
+        end
+
+        local title = create("TextLabel", {
+            Name = "Title",
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(52, 7),
+            Size = UDim2.new(1, -60, 0, 20),
+            Font = Enum.Font.GothamMedium,
+            Text = song.title,
+            TextColor3 = Theme.Text,
+            TextSize = 14,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        })
+        title.Parent = frame
+
+        create("TextLabel", {
+            Name = "Artist",
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(52, 27),
+            Size = UDim2.new(1, -60, 0, 16),
+            Font = Enum.Font.Gotham,
+            Text = song.artist,
+            TextColor3 = Theme.SubText,
+            TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            Parent = frame,
+        })
+
+        frame.MouseEnter:Connect(function()
+            if song ~= currentSong then
+                tween(frame, 0.15, { BackgroundTransparency = 0.75 })
+            end
+        end)
+        frame.MouseLeave:Connect(function()
+            if song ~= currentSong then
+                tween(frame, 0.2, { BackgroundTransparency = 1 })
+            end
+        end)
+
+        frame.MouseButton1Click:Connect(function()
+            playSong(song)
+        end)
+
+        frame.Parent = songList
+        rows[#rows + 1] = { frame = frame, title = title, song = song }
+    end
+
+    applyFilter()
+    highlightRows()
+end
+
+track(searchBox:GetPropertyChangedSignal("Text"):Connect(applyFilter))
+
+local function sortSongs()
+    table.sort(songs, function(a, b)
+        return a.title:lower() < b.title:lower()
+    end)
+end
+
+-- =====================================================================
+--  SCANNING (auto-detects files dropped into the Musix folder)
+-- =====================================================================
+local scanning = false
+
+local function rescan()
+    if scanning or not alive or not fsOk then return end
+    scanning = true
+
+    local files = listAudioFiles()
+    local changed = false
+
+    for i = #songs, 1, -1 do
+        local s = songs[i]
+        if not files[s.file] then
+            known[s.file] = nil
+            if s == currentSong then
+                switching = true
+                sound:Stop()
+                currentSong = nil
+                isPlaying = false
+                task.delay(0.3, function() switching = false end)
+                updateNowPlayingUI()
+            end
+            table.remove(songs, i)
+            changed = true
+        end
+    end
+
+    local newFiles = {}
+    for name in pairs(files) do
+        if not known[name] then newFiles[#newFiles + 1] = name end
+    end
+    table.sort(newFiles)
+
+    if changed then renderList() end
+
+    for _, name in ipairs(newFiles) do
+        if not alive then break end
+        local ok, song = pcall(loadSong, name)
+        if ok and song then
+            songs[#songs + 1] = song
+            known[name] = song
+            sortSongs()
+            renderList()
+        end
+        task.wait()
+    end
+
+    scanning = false
+end
+
+local function fullRescan()
+    if not fsOk then return end
+    cacheIndex = {}
+    saveIndex()
+    known = {}
+    songs = {}
+    if currentSong then
+        switching = true
+        sound:Stop()
+        currentSong = nil
+        isPlaying = false
+        task.delay(0.3, function() switching = false end)
+        updateNowPlayingUI()
+    end
+    renderList()
+    task.spawn(function()
+        while scanning do task.wait() end
+        rescan()
+    end)
+end
+
+-- =====================================================================
+--  SLIDERS
+-- =====================================================================
+local function makeSlider(hit, back, fill, knob, onChanged, onReleased)
+    local dragging = false
+    local lastRel = 0
+
+    local function visual(rel)
+        fill.Size = UDim2.fromScale(rel, 1)
+        knob.Position = UDim2.fromScale(rel, 0.5)
+    end
+
+    local function update(inputX)
+        local rel = math.clamp((inputX - back.AbsolutePosition.X) / back.AbsoluteSize.X, 0, 1)
+        lastRel = rel
+        visual(rel)
+        if onChanged then onChanged(rel) end
+    end
+
+    track(hit.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            tweenEx(knob, 0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out, { Size = UDim2.fromOffset(18, 18) })
+            update(input.Position.X)
+        end
+    end))
+
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+            update(input.Position.X)
+        end
+    end))
+
+    track(UserInputService.InputEnded:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch) then
+            dragging = false
+            tweenEx(knob, 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, { Size = UDim2.fromOffset(12, 12) })
+            if onReleased then onReleased(lastRel) end
+        end
+    end))
+
+    return {
+        set = visual,
+        isDragging = function() return dragging end,
+    }
+end
+
+local progress = makeSlider(barHit, barBack, barFill, barKnob,
+    function(rel)
+        local len = sound.TimeLength
+        if currentSong and len > 0 then
+            timeLeft.Text = fmtTime(len * rel)
+            timeRight.Text = "-" .. fmtTime(len * (1 - rel))
+        end
+    end,
+    function(rel)
+        local len = sound.TimeLength
+        if currentSong and len > 0 then
+            sound.TimePosition = rel * len
+        end
+    end
+)
+
+makeSlider(volHit, volBack, volFill, volKnob, function(rel)
+    sound.Volume = rel
+end)
+
+-- Live progress / time remaining
+local acc = 0
+track(RunService.Heartbeat:Connect(function(dt)
+    acc += dt
+    if acc < 0.15 then return end
+    acc = 0
+    if not currentSong then return end
+    local len = sound.TimeLength
+    if len <= 0 then return end
+    local pos = sound.TimePosition
+    local remaining = "-" .. fmtTime(len - pos)
+    pillTime.Text = remaining
+    if not progress.isDragging() then
+        progress.set(math.clamp(pos / len, 0, 1))
+        timeLeft.Text = fmtTime(pos)
+        timeRight.Text = remaining
+    end
+end))
+
+-- =====================================================================
+--  BUTTONS
+-- =====================================================================
+playBtn.MouseButton1Click:Connect(togglePlay)
+pillPlay.MouseButton1Click:Connect(togglePlay)
+nextBtn.MouseButton1Click:Connect(playNext)
+prevBtn.MouseButton1Click:Connect(playPrevious)
+
+shuffleBtn.MouseButton1Click:Connect(function()
+    shuffleOn = not shuffleOn
+    tween(shuffleBtn, 0.2, { TextColor3 = shuffleOn and Theme.Accent or Theme.Text })
+end)
+
+repeatBtn.MouseButton1Click:Connect(function()
+    repeatOn = not repeatOn
+    sound.Looped = repeatOn
+    tween(repeatBtn, 0.2, { TextColor3 = repeatOn and Theme.Accent or Theme.Text })
+end)
+
+refreshBtn.MouseButton1Click:Connect(function()
+    setMode(searchMode == "roblox" and "playlist" or "roblox")
+end)
+
+local function hoverable(btn, normal, hover)
+    btn.MouseEnter:Connect(function() tween(btn, 0.12, { BackgroundColor3 = hover }) end)
+    btn.MouseLeave:Connect(function() tween(btn, 0.12, { BackgroundColor3 = normal }) end)
+end
+hoverable(prevBtn, Theme.Element, Theme.Hover)
+hoverable(nextBtn, Theme.Element, Theme.Hover)
+hoverable(shuffleBtn, Theme.Element, Theme.Hover)
+hoverable(repeatBtn, Theme.Element, Theme.Hover)
+hoverable(closeBtn, Theme.Element, Color3.fromRGB(200, 60, 60))
+hoverable(minBtn, Theme.Element, Theme.Hover)
+
+-- Squish-on-press for every button
+local function pressable(btn)
+    local s = create("UIScale", { Scale = 1 })
+    s.Parent = btn
+    local function release()
+        tweenEx(s, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out, { Scale = 1 })
+    end
+    btn.MouseButton1Down:Connect(function()
+        tweenEx(s, 0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, { Scale = 0.88 })
+    end)
+    btn.MouseButton1Up:Connect(release)
+    btn.MouseLeave:Connect(release)
+end
+for _, b in ipairs({ playBtn, prevBtn, nextBtn, shuffleBtn, repeatBtn, refreshBtn, minBtn, closeBtn, pillPlay }) do
+    pressable(b)
+end
+
+-- ========= Minimize (to pill) / Restore / Close =========
+local animating = false
+local QUINT, BACK, QUAD = Enum.EasingStyle.Quint, Enum.EasingStyle.Back, Enum.EasingStyle.Quad
+local IN, OUT = Enum.EasingDirection.In, Enum.EasingDirection.Out
+
+-- Window grows out of the pill (or fades/zooms in on first launch)
+local function showWindow(fromPill)
+    window.Visible = true
+    if fromPill then
+        window.Position = getPillCenter()
+        windowScale.Scale = 0.08
+    else
+        window.Position = UDim2.fromScale(0.5, 0.5)
+        windowScale.Scale = 0.94
+    end
+    window.GroupTransparency = 1
+    tweenEx(window, 0.45, QUINT, OUT, { Position = UDim2.fromScale(0.5, 0.5), GroupTransparency = 0 })
+    tweenEx(windowScale, 0.45, QUINT, OUT, { Scale = 1 })
+    task.delay(0.46, function()
+        if not alive then return end
+        -- snap to the exact final state so nothing is left slightly shrunk or offset
+        windowScale.Scale = 1
+        window.Position = UDim2.fromScale(0.5, 0.5)
+        window.Size = UDim2.fromScale(1, 1)
+        window.GroupTransparency = 0
+        animating = false
+    end)
+end
+
+-- Window shrinks + flies into the topbar, then the pill pops out
+local function minimize()
+    if animating then return end
+    animating = true
+    updatePillLayout(false) -- re-read the topbar so the pill lands in the right spot
+    tween(blur, 0.35, { Size = 0 })
+    tweenEx(window, 0.35, QUINT, IN, { Position = getPillCenter(), GroupTransparency = 1 })
+    tweenEx(windowScale, 0.35, QUINT, IN, { Scale = 0.08 })
+
+    task.delay(0.22, function()
+        if not alive then return end
+        pillScale.Scale = 0.4
+        pill.Visible = true
+        tweenEx(pillScale, 0.4, BACK, OUT, { Scale = 1 })
+    end)
+    task.delay(0.37, function()
+        if not alive then return end
+        window.Visible = false
+        animating = false
+    end)
+end
+
+-- Pill squishes away, window grows out of its spot
+local function restore()
+    if animating then return end
+    animating = true
+    tween(blur, 0.4, { Size = BLUR_SIZE })
+    tweenEx(pillScale, 0.18, QUAD, IN, { Scale = 0.4 })
+    task.delay(0.16, function()
+        if not alive then return end
+        pill.Visible = false
+        showWindow(true)
+    end)
+end
+
+minBtn.MouseButton1Click:Connect(minimize)
+pillOpen.MouseButton1Click:Connect(restore)
+
+-- Close fades the window and the music out, then destroys everything
+closeBtn.MouseButton1Click:Connect(function()
+    if animating then return end
+    animating = true
+    tween(blur, 0.25, { Size = 0 })
+    tweenEx(window, 0.25, QUAD, IN, { GroupTransparency = 1 })
+    tweenEx(windowScale, 0.25, QUAD, IN, { Scale = 0.92 })
+    tweenEx(sound, 0.25, QUAD, IN, { Volume = 0 })
+    task.delay(0.28, function()
+        gui:Destroy()
+    end)
+end)
+
+-- ========= Cleanup =========
+gui.Destroying:Connect(function()
+    alive = false
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    pcall(function() sound:Stop() end)
+    pcall(function() sound:Destroy() end)
+    pcall(function() blur:Destroy() end)
+end)
+
+-- ========= Mount =========
+gui.Parent = parent
+tween(blur, 0.5, { Size = BLUR_SIZE })
+animating = true
+showWindow(false)
+
+renderList()
+updateNowPlayingUI()
+
+-- keep the pill glued to the end of the topbar buttons while it's showing
+task.spawn(function()
+    updatePillLayout(false)
+    while alive do
+        task.wait(1)
+        if pill.Visible then updatePillLayout(true) end
+    end
+end)
+
+task.spawn(function()
+    while alive do
+        rescan()
+        for _ = 1, 10 do
+            if not alive then return end
+            task.wait(0.25)
+        end
+    end
+end)

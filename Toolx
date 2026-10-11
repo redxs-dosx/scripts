@@ -1905,6 +1905,7 @@ do
 	------------------------------------------------------------------
 	local enforceHidden = false
 	local hidden = {} -- real topbar ScreenGui -> its original Enabled value
+	local hiddenInner = {} -- CoreGui.TopBarApp.TopBarApp -> { prop, was }
 	local hiddenConns = {}
 	local usedSetCore = false
 	local statusReal = "Real topbar: untouched"
@@ -1956,6 +1957,56 @@ do
 		return found, children
 	end
 
+	-- CoreGui > TopBarApp > TopBarApp (the inner object inside the real topbar ScreenGui)
+	local function findInnerTopbar()
+		local ok, inner = pcall(function()
+			local outer = CoreGui:FindFirstChild("TopBarApp")
+			return outer and outer:FindFirstChild("TopBarApp")
+		end)
+		if ok then
+			return inner
+		end
+		return nil
+	end
+
+	-- ScreenGuis toggle with Enabled, normal gui objects with Visible
+	local function innerProp(obj)
+		if obj:IsA("LayerCollector") then
+			return "Enabled"
+		end
+		if obj:IsA("GuiObject") then
+			return "Visible"
+		end
+		return nil
+	end
+
+	local function applyInnerHidden()
+		local inner = findInnerTopbar()
+		local prop = inner and innerProp(inner)
+		if not prop then
+			return
+		end
+		if hiddenInner[inner] == nil then
+			local okRead, was = pcall(function()
+				return inner[prop]
+			end)
+			hiddenInner[inner] = { prop = prop, was = okRead and was or true }
+			-- if Roblox turns it back on, turn it off again
+			pcall(function()
+				hiddenConns[#hiddenConns + 1] = inner:GetPropertyChangedSignal(prop):Connect(function()
+					if enforceHidden and inner[prop] then
+						pcall(function()
+							inner[prop] = false
+						end)
+					end
+				end)
+			end)
+		end
+		pcall(function()
+			inner[prop] = false
+		end)
+	end
+
 	local function applyHidden()
 		local list, children = findRealTopbars()
 		local names = {}
@@ -1984,6 +2035,8 @@ do
 				stillOn[#stillOn + 1] = g.Name
 			end
 		end
+
+		applyInnerHidden()
 
 		-- older clients also honour this
 		if not usedSetCore then
@@ -2027,6 +2080,12 @@ do
 				end)
 			end
 			table.clear(hidden)
+			for inner, info in pairs(hiddenInner) do
+				pcall(function()
+					inner[info.prop] = info.was
+				end)
+			end
+			table.clear(hiddenInner)
 			if usedSetCore then
 				usedSetCore = false
 				pcall(function()

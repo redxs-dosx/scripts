@@ -25,6 +25,14 @@ local Stats = game:GetService("Stats")
 
 local player = Players.LocalPlayer
 
+-- If Toolx is already running, close it first so its changes (hidden topbar, hooks, desync) are undone
+pcall(function()
+	local previous = getgenv().Toolx
+	if previous and previous.Close then
+		previous.Close()
+	end
+end)
+
 ---------------------------------------------------------------------
 -- Theme
 ---------------------------------------------------------------------
@@ -646,6 +654,93 @@ local function addTab(name)
 			SetEnabled = setEnabled,
 			IsEnabled = function()
 				return enabled
+			end,
+		}
+		if key then
+			registry[key] = comp
+		end
+		return comp
+	end
+
+	-- Segmented picker: one button per option, callback(name) fires when the choice changes
+	function api:Choice(text, options, default, callback, key)
+		local r = row(66)
+		new("TextLabel", {
+			Text = text,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 13,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 6),
+			Size = UDim2.new(1, -24, 0, 20),
+		}, r)
+		local strip = new("Frame", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 30),
+			Size = UDim2.new(1, -24, 0, 28),
+		}, r)
+		new("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			Padding = UDim.new(0, 6),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}, strip)
+
+		local count = #options
+		local buttons = {}
+		local selected = default or options[1]
+
+		local function paint()
+			for opt, b in pairs(buttons) do
+				local on = opt == selected
+				tween(b, 0.2, {
+					BackgroundColor3 = on and theme.accent or theme.off,
+					TextColor3 = on and theme.white or theme.dim,
+				})
+			end
+		end
+
+		local function choose(name, silent)
+			if buttons[name] == nil then
+				return
+			end
+			local changed = name ~= selected
+			selected = name
+			paint()
+			if changed and not silent then
+				if callback then
+					task.spawn(callback, name)
+				end
+				if key then
+					optionChanged()
+				end
+			end
+		end
+
+		for i, opt in ipairs(options) do
+			local b = new("TextButton", {
+				Text = opt,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 12,
+				AutoButtonColor = false,
+				BackgroundColor3 = theme.off,
+				TextColor3 = theme.dim,
+				BorderSizePixel = 0,
+				Size = UDim2.new(1 / count, -math.floor(6 * (count - 1) / count), 1, 0),
+				LayoutOrder = i,
+			}, strip)
+			corner(b, 6)
+			buttons[opt] = b
+			connect(b.Activated, function()
+				choose(opt)
+			end)
+		end
+		paint()
+
+		local comp = {
+			Set = choose,
+			Get = function()
+				return selected
 			end,
 		}
 		if key then
@@ -1473,6 +1568,1143 @@ do
 end
 
 ---------------------------------------------------------------------
+-- Topbar switcher: working 2018 / 2021 copies of Roblox's topbar, or the real one ("Current")
+-- 2018    = pre-March-2020 topbar: 36px translucent bar, hamburger, chat, username + account type,
+--           leaderstats, health bar.
+-- 2021    = March 2020 - 2023 topbar: round 32px buttons, Roblox logo, chat, "..." menu
+--           (Leaderboard / Emotes / Inventory), health bar.
+-- Current = Roblox's real topbar. It is hidden by disabling CoreGui.TopBarApp while a copy is shown.
+-- No emoji and no asset ids are used, every icon is drawn out of Frames.
+---------------------------------------------------------------------
+local Topbar = {}
+do
+	local GuiService = game:GetService("GuiService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local CoreGui = game:GetService("CoreGui")
+	local TextChatService = game:GetService("TextChatService")
+	local VIM
+	pcall(function()
+		VIM = game:GetService("VirtualInputManager")
+	end)
+	local LocalPlayer = player
+
+	local alive = true
+	local current = "Current"
+	local style = nil
+	local styleToken = 0
+	local cleanups = {}
+
+	local WHITE = Color3.new(1, 1, 1)
+	local BLACK = Color3.new(0, 0, 0)
+	local DARK = Color3.fromRGB(35, 37, 39)
+	local GRAY = Color3.fromRGB(165, 165, 165)
+	local RED = Color3.fromRGB(255, 28, 0)
+	local YELLOW = Color3.fromRGB(250, 235, 0)
+	local GREEN = Color3.fromRGB(27, 252, 107)
+
+	local function onClean(fn)
+		cleanups[#cleanups + 1] = fn
+	end
+	local function runCleanups()
+		for _, fn in ipairs(cleanups) do
+			pcall(fn)
+		end
+		table.clear(cleanups)
+	end
+	local function sconnect(signal, fn)
+		local c = signal:Connect(fn)
+		onClean(function()
+			c:Disconnect()
+		end)
+		return c
+	end
+
+	-- properties in one table, Parent is applied last
+	local function mk(class, props)
+		local o = Instance.new(class)
+		local parent = props.Parent
+		for k, v in pairs(props) do
+			if k ~= "Parent" then
+				o[k] = v
+			end
+		end
+		if parent then
+			o.Parent = parent
+		end
+		return o
+	end
+
+	------------------------------------------------------------------
+	-- the gui the copies live in. It ignores every inset (topbar area
+	-- and the device safe zones such as notches), so the bar reaches
+	-- the real edges of the screen instead of leaving blank sides.
+	------------------------------------------------------------------
+	local gui
+	local function ensureGui()
+		if gui and gui.Parent then
+			return gui
+		end
+		gui = mk("ScreenGui", {
+			Name = "ToolxTopbar",
+			ResetOnSpawn = false,
+			IgnoreGuiInset = true,
+			DisplayOrder = 10,
+			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		})
+		pcall(function()
+			gui.ScreenInsets = Enum.ScreenInsets.None
+		end)
+
+		local candidates = {
+			function()
+				return typeof(gethui) == "function" and gethui() or nil
+			end,
+			function()
+				return CoreGui
+			end,
+			function()
+				return player:WaitForChild("PlayerGui")
+			end,
+		}
+		for _, get in ipairs(candidates) do
+			local ok, parent = pcall(get)
+			if ok and parent then
+				pcall(function()
+					local old = parent:FindFirstChild("ToolxTopbar")
+					if old then
+						old:Destroy()
+					end
+				end)
+				local assigned = pcall(function()
+					gui.Parent = parent
+				end)
+				if assigned and gui.Parent == parent then
+					break
+				end
+			end
+		end
+		return gui
+	end
+
+	------------------------------------------------------------------
+	-- icon drawing (frames only)
+	------------------------------------------------------------------
+	local function box(parent, x, y, w, h, radius, color)
+		local f = mk("Frame", {
+			Position = UDim2.fromOffset(x, y),
+			Size = UDim2.fromOffset(w, h),
+			BackgroundColor3 = color or WHITE,
+			BorderSizePixel = 0,
+			Parent = parent,
+		})
+		if radius and radius > 0 then
+			corner(f, radius)
+		end
+		return f
+	end
+
+	-- outlined box; the stroke is drawn outside the frame, so inset by the thickness
+	local function outline(parent, x, y, w, h, radius, color, t)
+		local f = mk("Frame", {
+			Position = UDim2.fromOffset(x + t, y + t),
+			Size = UDim2.fromOffset(w - 2 * t, h - 2 * t),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Parent = parent,
+		})
+		if radius > 0 then
+			corner(f, math.max(radius - t, 0))
+		end
+		mk("UIStroke", {
+			Thickness = t,
+			Color = color,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Parent = f,
+		})
+		return f
+	end
+
+	local function shape(parent, x, y, w, h, radius, filled)
+		if filled then
+			return box(parent, x, y, w, h, radius, WHITE)
+		end
+		return outline(parent, x, y, w, h, radius, WHITE, 2)
+	end
+
+	local function clear(f)
+		for _, c in ipairs(f:GetChildren()) do
+			if not c:IsA("UIScale") then
+				c:Destroy()
+			end
+		end
+	end
+
+	local function holder(parent, w, h, scale)
+		local f = mk("Frame", {
+			Size = UDim2.fromOffset(w, h),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			BackgroundTransparency = 1,
+			Parent = parent,
+		})
+		if scale then
+			mk("UIScale", { Scale = scale, Parent = f })
+		end
+		return f
+	end
+
+	-- 32x25: three bars (the 2018 hamburger)
+	local function drawHamburger(f, color)
+		clear(f)
+		for i = 0, 2 do
+			box(f, 0, 1 + i * 10, 32, 3, 1, color)
+		end
+	end
+
+	-- 28x27: speech bubble
+	local function drawChat(f, on)
+		clear(f)
+		local c = on and WHITE or GRAY
+		box(f, 0, 1, 28, 20, 6, c)
+		local tail = box(f, 6, 15, 9, 9, 1, c)
+		tail.Rotation = 45
+		for i = 0, 2 do
+			box(f, 5 + i * 7, 9, 4, 4, 2, DARK)
+		end
+	end
+
+	-- 18x18: tilted square with a hole (Roblox logo)
+	local function drawLogo(f)
+		clear(f)
+		local g = mk("Frame", {
+			Size = UDim2.fromOffset(18, 18),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			BackgroundTransparency = 1,
+			Rotation = -12,
+			Parent = f,
+		})
+		box(g, 0, 0, 6, 18, 0, WHITE)
+		box(g, 12, 0, 6, 18, 0, WHITE)
+		box(g, 5, 0, 8, 6, 0, WHITE)
+		box(g, 5, 12, 8, 6, 0, WHITE)
+	end
+
+	-- 20x4: the "..." button
+	local function drawDots(f)
+		clear(f)
+		for i = 0, 2 do
+			box(f, i * 8, 0, 4, 4, 2, WHITE)
+		end
+	end
+
+	-- 24x24 icons for the "..." menu (outline = off, filled = on)
+	local function drawList(f, on)
+		clear(f)
+		shape(f, 2, 2, 20, 20, 5, on)
+		local c = on and DARK or WHITE
+		for i = 0, 2 do
+			box(f, 7, 7 + i * 4, 10, 2, 1, c)
+		end
+	end
+
+	local function drawEmote(f, on)
+		clear(f)
+		shape(f, 2, 2, 20, 20, 10, on)
+		local c = on and DARK or WHITE
+		box(f, 8, 8, 3, 3, 1, c)
+		box(f, 13, 8, 3, 3, 1, c)
+		local clip = mk("Frame", {
+			Position = UDim2.fromOffset(7, 13),
+			Size = UDim2.fromOffset(10, 4),
+			BackgroundTransparency = 1,
+			ClipsDescendants = true,
+			Parent = f,
+		})
+		local arc = mk("Frame", {
+			Position = UDim2.fromOffset(2, -4),
+			Size = UDim2.fromOffset(6, 6),
+			BackgroundTransparency = 1,
+			Parent = clip,
+		})
+		corner(arc, 3)
+		mk("UIStroke", {
+			Thickness = 2,
+			Color = c,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Parent = arc,
+		})
+	end
+
+	local function drawPack(f, on)
+		clear(f)
+		outline(f, 7, 1, 10, 10, 5, WHITE, 2)
+		shape(f, 3, 6, 18, 17, 6, on)
+		box(f, 7, 15, 10, 2, 1, on and DARK or WHITE)
+	end
+
+	-- unread-message badge (red circle)
+	local function makeBadge(parent, position)
+		local badge = mk("Frame", {
+			Name = "Unread",
+			Size = UDim2.fromOffset(18, 18),
+			Position = position,
+			BackgroundColor3 = Color3.fromRGB(226, 35, 26),
+			BorderSizePixel = 0,
+			Visible = false,
+			ZIndex = 5,
+			Parent = parent,
+		})
+		corner(badge, 9)
+		local label = mk("TextLabel", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Text = "",
+			ZIndex = 6,
+			Font = Enum.Font.SourceSansBold,
+			TextSize = 13,
+			TextColor3 = WHITE,
+			Parent = badge,
+		})
+		return function(n)
+			badge.Visible = n > 0
+			label.Text = (n >= 100) and "!" or tostring(n)
+		end
+	end
+
+	local function healthColor(p)
+		if p <= 0.1 then
+			return RED
+		end
+		if p >= 0.8 then
+			return GREEN
+		end
+		if p < 0.5 then
+			return RED:Lerp(YELLOW, (p - 0.1) / 0.4)
+		end
+		return YELLOW:Lerp(GREEN, (p - 0.5) / 0.3)
+	end
+
+	------------------------------------------------------------------
+	-- the real topbar: hide / restore
+	------------------------------------------------------------------
+	local enforceHidden, hiddenByUs, usedSetCore = false, false, false
+	local realOriginal, realConn, realHooked = nil, nil, nil
+
+	local function realGui()
+		local g = CoreGui:FindFirstChild("TopBarApp")
+		if g and g:IsA("ScreenGui") then
+			return g
+		end
+		return nil
+	end
+
+	local function applyHidden()
+		local g = realGui()
+		if g then
+			if realOriginal == nil then
+				realOriginal = g.Enabled
+			end
+			hiddenByUs = true
+			if g.Enabled then
+				pcall(function()
+					g.Enabled = false
+				end)
+			end
+			if realHooked ~= g then
+				if realConn then
+					realConn:Disconnect()
+				end
+				realHooked = g
+				realConn = g:GetPropertyChangedSignal("Enabled"):Connect(function()
+					if enforceHidden and g.Enabled then
+						pcall(function()
+							g.Enabled = false
+						end)
+					end
+				end)
+			end
+		elseif not usedSetCore then
+			-- fallback for clients where the gui isn't found
+			usedSetCore = true
+			hiddenByUs = true
+			pcall(function()
+				StarterGui:SetCore("TopbarEnabled", false)
+			end)
+		end
+	end
+
+	local function setRealVisible(visible)
+		enforceHidden = not visible
+		if visible then
+			if realConn then
+				realConn:Disconnect()
+				realConn = nil
+			end
+			realHooked = nil
+			if hiddenByUs then
+				hiddenByUs = false
+				local g = realGui()
+				if g then
+					pcall(function()
+						g.Enabled = (realOriginal ~= false)
+					end)
+				end
+				if usedSetCore then
+					usedSetCore = false
+					pcall(function()
+						StarterGui:SetCore("TopbarEnabled", true)
+					end)
+				end
+			end
+		else
+			applyHidden()
+		end
+	end
+
+	------------------------------------------------------------------
+	-- actions (what the buttons actually do)
+	------------------------------------------------------------------
+	local function sendKey(key)
+		if not VIM then
+			return false
+		end
+		return pcall(function()
+			VIM:SendKeyEvent(true, key, false, game)
+			task.wait(0.05)
+			VIM:SendKeyEvent(false, key, false, game)
+		end)
+	end
+
+	local function isMenuOpen()
+		local ok, v = pcall(function()
+			return GuiService.MenuIsOpen
+		end)
+		return ok and v == true
+	end
+
+	local function toggleMenu()
+		local before = isMenuOpen()
+		local function changed()
+			task.wait(0.2)
+			return isMenuOpen() ~= before
+		end
+		if pcall(function()
+			GuiService:SetMenuIsOpen(not before)
+		end) and changed() then
+			return
+		end
+		if pcall(function()
+			require(CoreGui.RobloxGui.Modules.Settings.SettingsHub):ToggleVisibility()
+		end) and changed() then
+			return
+		end
+		sendKey(Enum.KeyCode.Escape)
+	end
+
+	local chatState = true
+	local function usingTextChat()
+		local ok, v = pcall(function()
+			return TextChatService.ChatVersion == Enum.ChatVersion.TextChatService
+		end)
+		return ok and v == true
+	end
+
+	local function chatVisible()
+		if usingTextChat() then
+			local ok, v = pcall(function()
+				return TextChatService.ChatWindowConfiguration.Enabled
+			end)
+			if ok and type(v) == "boolean" then
+				return v
+			end
+		else
+			local ok, v = pcall(function()
+				return StarterGui:GetCore("ChatActive")
+			end)
+			if ok and type(v) == "boolean" then
+				return v
+			end
+		end
+		return chatState
+	end
+
+	local function toggleChat()
+		local want = not chatVisible()
+		chatState = want
+		if usingTextChat() then
+			pcall(function()
+				TextChatService.ChatWindowConfiguration.Enabled = want
+			end)
+			pcall(function()
+				TextChatService.ChatInputBarConfiguration.Enabled = want
+			end)
+		else
+			local ok = pcall(function()
+				StarterGui:SetCore("ChatActive", want)
+			end)
+			if not ok then
+				pcall(function()
+					StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, want)
+				end)
+			end
+		end
+	end
+
+	local function playerListOn()
+		local ok, v = pcall(function()
+			return StarterGui:GetCoreGuiEnabled(Enum.CoreGuiType.PlayerList)
+		end)
+		return ok and v == true
+	end
+	local function togglePlayerList()
+		pcall(function()
+			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList, not playerListOn())
+		end)
+	end
+
+	local function emotesOpen()
+		local ok, v = pcall(function()
+			return GuiService:GetEmotesMenuOpen()
+		end)
+		return ok and v == true
+	end
+	local function toggleEmotes()
+		pcall(function()
+			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.EmotesMenu, true)
+		end)
+		pcall(function()
+			GuiService:SetEmotesMenuOpen(not emotesOpen())
+		end)
+	end
+
+	local invState = false
+	local function inventoryOpen()
+		local ok, v = pcall(function()
+			return require(CoreGui.RobloxGui.Modules.BackpackScript).IsOpen
+		end)
+		if ok and type(v) == "boolean" then
+			return v
+		end
+		return invState
+	end
+	local function toggleInventory()
+		pcall(function()
+			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true)
+		end)
+		local ok = pcall(function()
+			require(CoreGui.RobloxGui.Modules.BackpackScript):OpenClose()
+		end)
+		if not ok then
+			sendKey(Enum.KeyCode.Backquote)
+		end
+		invState = not invState
+	end
+
+	-- unread chat counter
+	local unread = 0
+	local function trackUnread(setBadge)
+		local function onMessage()
+			if not chatVisible() then
+				unread = unread + 1
+				setBadge(unread)
+			end
+		end
+		pcall(function()
+			sconnect(TextChatService.MessageReceived, onMessage)
+		end)
+		pcall(function()
+			local folder = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+			local ev = folder and folder:FindFirstChild("OnMessageDoneFiltering")
+			if ev then
+				sconnect(ev.OnClientEvent, onMessage)
+			end
+		end)
+	end
+
+	-- health: update(percent, isFull)
+	local function bindHealth(update, token)
+		local hconn
+		local function hook(char)
+			if hconn then
+				hconn:Disconnect()
+				hconn = nil
+			end
+			if not char then
+				return
+			end
+			task.spawn(function()
+				local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 10)
+				if not hum or not alive or token ~= styleToken then
+					return
+				end
+				if hconn then
+					hconn:Disconnect()
+				end
+				local function upd()
+					local mh = math.max(hum.MaxHealth, 1)
+					update(math.clamp(hum.Health / mh, 0, 1), hum.Health >= hum.MaxHealth)
+				end
+				hconn = hum.HealthChanged:Connect(upd)
+				upd()
+			end)
+		end
+		sconnect(LocalPlayer.CharacterAdded, hook)
+		onClean(function()
+			if hconn then
+				hconn:Disconnect()
+			end
+		end)
+		hook(LocalPlayer.Character)
+	end
+
+	local function accountText()
+		local ok, under13 = pcall(function()
+			return LocalPlayer:GetUnder13()
+		end)
+		return (ok and under13) and "Account: <13" or "Account: 13+"
+	end
+
+	local function statList()
+		local list = {}
+		local ls = LocalPlayer:FindFirstChild("leaderstats")
+		if ls then
+			for _, v in ipairs(ls:GetChildren()) do
+				if v:IsA("IntValue") or v:IsA("NumberValue") or v:IsA("StringValue") then
+					list[#list + 1] = v
+				end
+			end
+		end
+		return list
+	end
+
+	local function statSig()
+		local t = {}
+		for _, v in ipairs(statList()) do
+			t[#t + 1] = v.Name
+		end
+		return table.concat(t, "|")
+	end
+
+	------------------------------------------------------------------
+	-- 2018 topbar  (layout and colours taken from Roblox's old Topbar.lua)
+	------------------------------------------------------------------
+	local function build2018()
+		styleToken = styleToken + 1
+		local token = styleToken
+
+		local root = mk("Frame", {
+			Name = "Topbar2018",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			ZIndex = 1,
+			Parent = ensureGui(),
+		})
+		local bar = mk("Frame", {
+			Name = "TopBarContainer",
+			Size = UDim2.new(1, 0, 0, 36),
+			BackgroundColor3 = Color3.fromRGB(31, 31, 31),
+			BackgroundTransparency = 0.5,
+			BorderSizePixel = 0,
+			Active = true,
+			Parent = root,
+		})
+		local shadow = mk("Frame", {
+			Name = "TopBarShadow",
+			Position = UDim2.new(0, 0, 1, 0),
+			Size = UDim2.new(1, 0, 0, 3),
+			BackgroundColor3 = BLACK,
+			BorderSizePixel = 0,
+			Visible = false,
+			Parent = bar,
+		})
+		mk("UIGradient", {
+			Rotation = 90,
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0.55),
+				NumberSequenceKeypoint.new(1, 1),
+			}),
+			Parent = shadow,
+		})
+
+		local function slot(name, x)
+			return mk("TextButton", {
+				Name = name,
+				Size = UDim2.fromOffset(50, 36),
+				Position = UDim2.fromOffset(x, 0),
+				BackgroundTransparency = 1,
+				Text = "",
+				AutoButtonColor = false,
+				Parent = bar,
+			})
+		end
+
+		-- left: hamburger (Roblox menu) + chat
+		local menuBtn = slot("Settings", 0)
+		local hamburger = holder(menuBtn, 32, 25)
+		drawHamburger(hamburger, WHITE)
+		menuBtn.Activated:Connect(toggleMenu)
+
+		local chatBtn = slot("Chat", 50)
+		local chatIcon = holder(chatBtn, 28, 27)
+		drawChat(chatIcon, true)
+		local setBadge = makeBadge(chatBtn, UDim2.fromOffset(27, 0))
+		chatBtn.Activated:Connect(toggleChat)
+		trackUnread(setBadge)
+
+		-- right: name + account type + health, with leaderstats to its left
+		local nameBtn = mk("TextButton", {
+			Name = "NameHealthContainer",
+			Size = UDim2.new(0, 170, 1, 0),
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.fromScale(1, 0),
+			BackgroundTransparency = 1,
+			Text = "",
+			AutoButtonColor = false,
+			Parent = bar,
+		})
+		mk("TextLabel", {
+			Name = "Username",
+			Text = LocalPlayer.Name,
+			Size = UDim2.new(1, -14, 0, 18),
+			Position = UDim2.fromOffset(7, 0),
+			Font = Enum.Font.SourceSansBold,
+			TextSize = 14,
+			BackgroundTransparency = 1,
+			TextColor3 = WHITE,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Bottom,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Parent = nameBtn,
+		})
+		mk("TextLabel", {
+			Name = "AccountType",
+			Text = accountText(),
+			Size = UDim2.new(1, -14, 0, 9),
+			Position = UDim2.fromOffset(7, 20),
+			Font = Enum.Font.SourceSans,
+			TextSize = 11,
+			BackgroundTransparency = 1,
+			TextColor3 = WHITE,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Bottom,
+			Parent = nameBtn,
+		})
+		local healthBack = mk("Frame", {
+			Name = "HealthContainer",
+			Size = UDim2.new(1, -14, 0, 3),
+			Position = UDim2.new(0, 7, 1, -7),
+			BackgroundColor3 = Color3.fromRGB(228, 236, 246),
+			BorderSizePixel = 0,
+			Visible = false,
+			Parent = nameBtn,
+		})
+		local healthFill = mk("Frame", {
+			Name = "HealthFill",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = GREEN,
+			BorderSizePixel = 0,
+			Parent = healthBack,
+		})
+		nameBtn.Activated:Connect(togglePlayerList)
+		bindHealth(function(p, full)
+			healthBack.Visible = not full
+			healthFill.Size = UDim2.fromScale(p, 1)
+			healthFill.BackgroundColor3 = healthColor(p)
+		end, token)
+
+		local stats = mk("TextButton", {
+			Name = "LeaderstatsContainer",
+			Size = UDim2.new(0, 0, 1, 0),
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -170, 0, 0),
+			BackgroundTransparency = 1,
+			Text = "",
+			AutoButtonColor = false,
+			Parent = bar,
+		})
+		stats.Activated:Connect(togglePlayerList)
+
+		local valueConns = {}
+		onClean(function()
+			for _, c in ipairs(valueConns) do
+				c:Disconnect()
+			end
+		end)
+		local function rebuildStats()
+			for _, c in ipairs(valueConns) do
+				c:Disconnect()
+			end
+			table.clear(valueConns)
+			for _, c in ipairs(stats:GetChildren()) do
+				c:Destroy()
+			end
+			local cam = workspace.CurrentCamera
+			local vs = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+			local small = UserInputService.TouchEnabled and (vs.Y < 500 or vs.X < 700)
+			local n = 0
+			for i, v in ipairs(statList()) do
+				if not small or i == 1 then
+					n = n + 1
+					local col = mk("Frame", {
+						Name = "Column" .. i,
+						Size = UDim2.new(0, 75, 1, 0),
+						Position = UDim2.fromOffset(2 + 77 * (n - 1), 0),
+						BackgroundTransparency = 1,
+						Parent = stats,
+					})
+					mk("TextLabel", {
+						Name = "ColumnName",
+						Text = v.Name,
+						Size = UDim2.new(1, 0, 0, 10),
+						Position = UDim2.fromOffset(0, 4),
+						Font = Enum.Font.SourceSans,
+						TextSize = 14,
+						BackgroundTransparency = 1,
+						TextColor3 = WHITE,
+						TextTruncate = Enum.TextTruncate.AtEnd,
+						Parent = col,
+					})
+					local val = mk("TextLabel", {
+						Name = "ColumnValue",
+						Text = tostring(v.Value),
+						Size = UDim2.new(1, 0, 0, 10),
+						Position = UDim2.fromOffset(0, 19),
+						Font = Enum.Font.SourceSansBold,
+						TextSize = 14,
+						BackgroundTransparency = 1,
+						TextColor3 = WHITE,
+						TextTruncate = Enum.TextTruncate.AtEnd,
+						Parent = col,
+					})
+					valueConns[#valueConns + 1] = v:GetPropertyChangedSignal("Value"):Connect(function()
+						val.Text = tostring(v.Value)
+					end)
+				end
+			end
+			stats.Size = UDim2.new(0, 77 * n, 1, 0)
+		end
+
+		local lastOpen, lastChat, lastSig
+		local function refresh()
+			local open = isMenuOpen()
+			bar.BackgroundTransparency = open and 0 or 0.5
+			shadow.Visible = open
+			if open ~= lastOpen then
+				lastOpen = open
+				drawHamburger(hamburger, open and Color3.fromRGB(190, 190, 190) or WHITE)
+			end
+			local cv = chatVisible()
+			if cv ~= lastChat then
+				lastChat = cv
+				drawChat(chatIcon, cv)
+			end
+			if cv and unread > 0 then
+				unread = 0
+				setBadge(0)
+			end
+			local sig = statSig()
+			if sig ~= lastSig then
+				lastSig = sig
+				rebuildStats()
+			end
+		end
+		refresh()
+		return { root = root, refresh = refresh }
+	end
+
+	------------------------------------------------------------------
+	-- 2021 topbar  (spec from Roblox's March 2020 topbar announcement:
+	-- 32x32 round buttons, 4px from top, 16px side padding, 12px gap,
+	-- 80x6 health bar, "..." menu with Leaderboard / Emotes / Inventory)
+	------------------------------------------------------------------
+	local ROWS = {
+		{ label = "Leaderboard", key = "Tab", draw = drawList, get = playerListOn, act = togglePlayerList, close = false },
+		{ label = "Emotes", key = ".", draw = drawEmote, get = emotesOpen, act = toggleEmotes, close = true },
+		{ label = "Inventory", key = "`", draw = drawPack, get = inventoryOpen, act = toggleInventory, close = true },
+	}
+
+	local function build2021()
+		styleToken = styleToken + 1
+		local token = styleToken
+
+		local root = mk("Frame", {
+			Name = "Topbar2021",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			ZIndex = 1,
+			Parent = ensureGui(),
+		})
+
+		local function circle(name, position, anchor)
+			local b = mk("TextButton", {
+				Name = name,
+				Size = UDim2.fromOffset(32, 32),
+				Position = position,
+				AnchorPoint = anchor or Vector2.new(0, 0),
+				BackgroundColor3 = BLACK,
+				BackgroundTransparency = 0.5,
+				BorderSizePixel = 0,
+				Text = "",
+				AutoButtonColor = false,
+				Parent = root,
+			})
+			corner(b, 16)
+			return b
+		end
+		local function solid(b, on)
+			b.BackgroundTransparency = on and 0.25 or 0.5
+		end
+
+		local rbxBtn = circle("RobloxMenu", UDim2.fromOffset(16, 4))
+		drawLogo(holder(rbxBtn, 18, 18))
+		rbxBtn.Activated:Connect(toggleMenu)
+
+		local chatBtn = circle("Chat", UDim2.fromOffset(60, 4))
+		local chatIcon = holder(chatBtn, 28, 27, 0.72)
+		drawChat(chatIcon, true)
+		local setBadge = makeBadge(chatBtn, UDim2.fromOffset(20, -6))
+		chatBtn.Activated:Connect(toggleChat)
+		trackUnread(setBadge)
+
+		local moreBtn = circle("More", UDim2.new(1, -16, 0, 4), Vector2.new(1, 0))
+		drawDots(holder(moreBtn, 20, 4))
+
+		-- health bar (80x6, 12px left of the "..." button, only when damaged)
+		local hb = mk("Frame", {
+			Name = "Health",
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -60, 0, 20),
+			Size = UDim2.fromOffset(80, 6),
+			BackgroundColor3 = BLACK,
+			BackgroundTransparency = 0.5,
+			BorderSizePixel = 0,
+			Visible = false,
+			Parent = root,
+		})
+		corner(hb, 3)
+		local fill = mk("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = GREEN,
+			BorderSizePixel = 0,
+			Parent = hb,
+		})
+		corner(fill, 3)
+		bindHealth(function(p, full)
+			hb.Visible = not full
+			fill.Size = UDim2.fromScale(p, 1)
+			fill.BackgroundColor3 = healthColor(p)
+		end, token)
+
+		-- "..." menu
+		local rowH = 48
+		local dropdownOpen = false
+		local backdrop = mk("TextButton", {
+			Name = "Backdrop",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Text = "",
+			AutoButtonColor = false,
+			Visible = false,
+			ZIndex = 2,
+			Parent = root,
+		})
+		local menuPanel = mk("Frame", {
+			Name = "GameContextMenu",
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -16, 0, 44),
+			Size = UDim2.fromOffset(264, #ROWS * rowH + 16),
+			BackgroundColor3 = BLACK,
+			BackgroundTransparency = 0.25,
+			BorderSizePixel = 0,
+			Active = true,
+			Visible = false,
+			ZIndex = 3,
+			Parent = root,
+		})
+		corner(menuPanel, 8)
+
+		local rowViews = {}
+		local function refreshRows()
+			for _, rv in ipairs(rowViews) do
+				local on = rv.def.get() and true or false
+				if on ~= rv.last then
+					rv.last = on
+					rv.def.draw(rv.icon, on)
+				end
+			end
+		end
+		local function setDropdown(open)
+			dropdownOpen = open
+			menuPanel.Visible = open
+			backdrop.Visible = open
+			solid(moreBtn, open)
+			if open then
+				refreshRows()
+			end
+		end
+		moreBtn.Activated:Connect(function()
+			setDropdown(not dropdownOpen)
+		end)
+		backdrop.Activated:Connect(function()
+			setDropdown(false)
+		end)
+
+		for i, def in ipairs(ROWS) do
+			local b = mk("TextButton", {
+				Name = def.label,
+				Size = UDim2.new(1, -16, 0, rowH),
+				Position = UDim2.fromOffset(8, 8 + (i - 1) * rowH),
+				BackgroundColor3 = WHITE,
+				BackgroundTransparency = 1,
+				Text = "",
+				AutoButtonColor = false,
+				Parent = menuPanel,
+			})
+			corner(b, 6)
+			local icon = holder(b, 24, 24)
+			icon.AnchorPoint = Vector2.new(0, 0.5)
+			icon.Position = UDim2.new(0, 12, 0.5, 0)
+			mk("TextLabel", {
+				Size = UDim2.new(1, -100, 1, 0),
+				Position = UDim2.fromOffset(48, 0),
+				BackgroundTransparency = 1,
+				Text = def.label,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 16,
+				TextColor3 = WHITE,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Parent = b,
+			})
+			if UserInputService.KeyboardEnabled then
+				mk("TextLabel", {
+					AnchorPoint = Vector2.new(1, 0),
+					Position = UDim2.new(1, -12, 0, 0),
+					Size = UDim2.new(0, 40, 1, 0),
+					BackgroundTransparency = 1,
+					Text = def.key,
+					Font = Enum.Font.GothamMedium,
+					TextSize = 14,
+					TextColor3 = GRAY,
+					TextXAlignment = Enum.TextXAlignment.Right,
+					Parent = b,
+				})
+			end
+			b.MouseEnter:Connect(function()
+				b.BackgroundTransparency = 0.88
+			end)
+			b.MouseLeave:Connect(function()
+				b.BackgroundTransparency = 1
+			end)
+			b.Activated:Connect(function()
+				def.act()
+				if def.close then
+					setDropdown(false)
+				end
+				task.delay(0.25, function()
+					pcall(refreshRows)
+				end)
+			end)
+			rowViews[#rowViews + 1] = { def = def, icon = icon, last = nil }
+		end
+
+		local lastChat
+		local function refresh()
+			solid(rbxBtn, isMenuOpen())
+			local cv = chatVisible()
+			solid(chatBtn, cv)
+			if cv ~= lastChat then
+				lastChat = cv
+				drawChat(chatIcon, cv)
+			end
+			if cv and unread > 0 then
+				unread = 0
+				setBadge(0)
+			end
+			if dropdownOpen then
+				refreshRows()
+			end
+		end
+		refresh()
+		return { root = root, refresh = refresh }
+	end
+
+	------------------------------------------------------------------
+	-- switching
+	------------------------------------------------------------------
+	local loopRunning = false
+	local function ensureLoop()
+		if loopRunning then
+			return
+		end
+		loopRunning = true
+		task.spawn(function()
+			while alive do
+				if enforceHidden then
+					pcall(applyHidden)
+				end
+				if style and style.refresh then
+					pcall(style.refresh)
+				end
+				task.wait(0.2)
+			end
+			loopRunning = false
+		end)
+	end
+
+	-- name: "2018", "2021" or "Current" (the real topbar)
+	function Topbar.Set(name)
+		if not alive then
+			return
+		end
+		if name ~= "2018" and name ~= "2021" and name ~= "Current" then
+			return
+		end
+		runCleanups()
+		if style and style.root then
+			style.root:Destroy()
+		end
+		style = nil
+		current = name
+		if name == "Current" then
+			-- bring the real topbar back, the copy is gone
+			setRealVisible(true)
+		else
+			-- hide the real topbar while a copy is shown
+			setRealVisible(false)
+			style = (name == "2018") and build2018() or build2021()
+			ensureLoop()
+		end
+	end
+
+	function Topbar.Get()
+		return current
+	end
+
+	-- puts the real topbar back and removes everything we made
+	function Topbar.Unload()
+		if not alive then
+			return
+		end
+		alive = false
+		runCleanups()
+		if style and style.root then
+			pcall(function()
+				style.root:Destroy()
+			end)
+		end
+		style = nil
+		setRealVisible(true)
+		if gui then
+			pcall(function()
+				gui:Destroy()
+			end)
+			gui = nil
+		end
+	end
+end
+
+---------------------------------------------------------------------
 -- Chat logger: "[HH:MM:SS] username: message"
 ---------------------------------------------------------------------
 local ChatLog = { entries = {} }
@@ -2039,6 +3271,12 @@ playerTab:Toggle("Anti-fling", false, function(state)
 end, "protect.antifling")
 
 local worldTab = addTab("World")
+worldTab:Section("Topbar")
+worldTab:Choice("Topbar style", { "2018", "2021", "Current" }, "Current", function(name)
+	Topbar.Set(name)
+end, "world.topbar")
+worldTab:Label("2018 and 2021 swap Roblox's topbar for a working copy that reaches the screen edges. Current is Roblox's real topbar: it is hidden while a copy is shown and comes back when you pick Current or close Toolx.")
+
 worldTab:Section("Explorer")
 
 local DEX_URL = "https://raw.githubusercontent.com/infyiff/backup/main/dex.lua"
@@ -2400,6 +3638,7 @@ function Toolx.Close()
 	pcall(Mods.Unload)
 	pcall(ChatLog.Stop)
 	pcall(LoadLogger.Stop)
+	pcall(Topbar.Unload)
 	tween(blur, 0.3, { Size = 0 })
 	tween(main, 0.3, { GroupTransparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
 	tween(mainScale, 0.3, { Scale = 0.9 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)

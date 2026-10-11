@@ -1689,7 +1689,7 @@ do
 	-- The copies are drawn at their original size and scaled up as a whole. The root is
 	-- 1/scale of the screen and UIScale brings it back to full screen, so right-anchored
 	-- buttons still sit on the right edge.
-	local uiScale = 1.3
+	local uiScale = 1.15
 	local function scaledRoot(name)
 		local root = mk("Frame", {
 			Name = name,
@@ -2142,42 +2142,28 @@ do
 
 	local function toggleMenu()
 		local before = isMenuOpen()
-		local want = not before
-		local function changed()
+		-- the menu button just presses Escape, same as the keyboard
+		if sendKey(Enum.KeyCode.Escape) then
 			task.wait(0.3)
-			return isMenuOpen() ~= before
+			if canSeeMenuWindow() then
+				setActionStatus("Menu: Escape pressed (" .. (isMenuOpen() and "open" or "closed") .. ")")
+			else
+				setActionStatus("Menu: Escape pressed")
+			end
+			return
 		end
-		local notes = {}
 
-		-- 1) Roblox's own settings menu module
-		local ok, err = pcall(function()
+		-- no VirtualInputManager on this executor: fall back to Roblox's own menu module
+		local want = not before
+		local ok = pcall(function()
 			require(CoreGui.RobloxGui.Modules.Settings.SettingsHub):SetVisibility(want)
 		end)
-		if ok and (changed() or not canSeeMenuWindow()) then
-			-- if the window can't be seen we can't confirm, but the call worked, so don't also press Escape
-			setActionStatus("Menu: " .. (want and "opened" or "closed") .. " (SettingsHub)")
-			return
+		if not ok then
+			ok = pcall(function()
+				GuiService:SetMenuIsOpen(want)
+			end)
 		end
-		notes[#notes + 1] = "SettingsHub " .. (ok and "no change" or tostring(err):sub(1, 40))
-
-		-- 2) the Escape key
-		if sendKey(Enum.KeyCode.Escape) and (changed() or not canSeeMenuWindow()) then
-			setActionStatus("Menu: " .. (want and "opened" or "closed") .. " (Escape key)")
-			return
-		end
-		notes[#notes + 1] = VIM and "Escape key no change" or "no VirtualInputManager"
-
-		-- 3) the MenuIsOpen flag
-		local ok3 = pcall(function()
-			GuiService:SetMenuIsOpen(want)
-		end)
-		if ok3 and changed() then
-			setActionStatus("Menu: " .. (want and "opened" or "closed") .. " (SetMenuIsOpen)")
-			return
-		end
-		notes[#notes + 1] = "SetMenuIsOpen " .. (ok3 and "no change" or "failed")
-
-		setActionStatus("Menu: nothing worked (" .. table.concat(notes, ", ") .. ")")
+		setActionStatus(ok and ("Menu: " .. (want and "opened" or "closed") .. " (no Escape key available)") or "Menu: nothing worked")
 	end
 
 	local chatState = true
@@ -2207,6 +2193,17 @@ do
 		return chatState
 	end
 
+	-- the actual chat window of the new chat (CoreGui.ExperienceChat.appLayout.chatWindow)
+	local function experienceChatWindow()
+		local ok, w = pcall(function()
+			return CoreGui.ExperienceChat.appLayout.chatWindow
+		end)
+		if ok and w then
+			return w
+		end
+		return nil
+	end
+
 	local function toggleChat()
 		local want = not chatVisible()
 		chatState = want
@@ -2217,6 +2214,13 @@ do
 			pcall(function()
 				TextChatService.ChatInputBarConfiguration.Enabled = want
 			end)
+			-- also show / hide the window itself, in case the configuration is ignored
+			local window = experienceChatWindow()
+			if window then
+				pcall(function()
+					window.Visible = want
+				end)
+			end
 		else
 			local ok = pcall(function()
 				StarterGui:SetCore("ChatActive", want)
@@ -3480,7 +3484,7 @@ worldTab:Section("Topbar")
 worldTab:Choice("Topbar style", { "2018", "2021", "Current" }, "Current", function(name)
 	Topbar.Set(name)
 end, "world.topbar")
-worldTab:Slider("Topbar size (%)", 80, 200, 130, function(v)
+worldTab:Slider("Topbar size (%)", 80, 200, 115, function(v)
 	Topbar.SetScale(v)
 end, "world.topbarSize")
 local topbarStatus = worldTab:Label("Real topbar: untouched")
@@ -3949,6 +3953,22 @@ if keepEnabled then
 		end
 	end
 	loadingOptions = false
+
+	-- make sure the saved topbar really gets applied (size first, then style)
+	local savedStyle = savedData.options["world.topbar"]
+	if savedStyle == "2018" or savedStyle == "2021" then
+		local savedSize = savedData.options["world.topbarSize"]
+		task.spawn(function()
+			task.wait(0.5)
+			if closing then
+				return
+			end
+			if typeof(savedSize) == "number" then
+				pcall(Topbar.SetScale, savedSize)
+			end
+			pcall(Topbar.Set, savedStyle)
+		end)
+	end
 end
 
 selectTab(toolsTab)

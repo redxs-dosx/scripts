@@ -1648,7 +1648,7 @@ do
 			Name = "ToolxTopbar",
 			ResetOnSpawn = false,
 			IgnoreGuiInset = true,
-			DisplayOrder = 10,
+			DisplayOrder = 100,
 			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 		})
 		pcall(function()
@@ -1684,6 +1684,22 @@ do
 			end
 		end
 		return gui
+	end
+
+	-- The copies are drawn at their original size and scaled up as a whole. The root is
+	-- 1/scale of the screen and UIScale brings it back to full screen, so right-anchored
+	-- buttons still sit on the right edge.
+	local uiScale = 1.3
+	local function scaledRoot(name)
+		local root = mk("Frame", {
+			Name = name,
+			Size = UDim2.fromScale(1 / uiScale, 1 / uiScale),
+			BackgroundTransparency = 1,
+			ZIndex = 1,
+			Parent = ensureGui(),
+		})
+		local ui = mk("UIScale", { Scale = uiScale, Parent = root })
+		return root, ui
 	end
 
 	------------------------------------------------------------------
@@ -1781,7 +1797,6 @@ do
 			AnchorPoint = Vector2.new(0.5, 0.5),
 			Position = UDim2.fromScale(0.5, 0.5),
 			BackgroundTransparency = 1,
-			Rotation = -12,
 			Parent = f,
 		})
 		box(g, 0, 0, 6, 18, 0, WHITE)
@@ -1888,75 +1903,138 @@ do
 	------------------------------------------------------------------
 	-- the real topbar: hide / restore
 	------------------------------------------------------------------
-	local enforceHidden, hiddenByUs, usedSetCore = false, false, false
-	local realOriginal, realConn, realHooked = nil, nil, nil
+	local enforceHidden = false
+	local hidden = {} -- real topbar ScreenGui -> its original Enabled value
+	local hiddenConns = {}
+	local usedSetCore = false
+	local statusReal = "Real topbar: untouched"
+	local statusAction = ""
+	local loggedChildren = false
 
-	local function realGui()
-		local g = CoreGui:FindFirstChild("TopBarApp")
-		if g and g:IsA("ScreenGui") then
-			return g
+	local function pushStatus()
+		if Topbar.OnStatus then
+			pcall(Topbar.OnStatus, statusReal .. (statusAction ~= "" and ("\n" .. statusAction) or ""))
 		end
-		return nil
+	end
+	local function setRealStatus(text)
+		if text ~= statusReal then
+			statusReal = text
+			pushStatus()
+		end
+	end
+	local function setActionStatus(text)
+		statusAction = text
+		pushStatus()
+	end
+
+	local function isEnabled(g)
+		local ok, v = pcall(function()
+			return g.Enabled
+		end)
+		return (not ok) or v
+	end
+
+	-- every ScreenGui in CoreGui that looks like Roblox's topbar
+	local function findRealTopbars()
+		local found = {}
+		local ok, children = pcall(function()
+			return CoreGui:GetChildren()
+		end)
+		if not ok then
+			return found, nil
+		end
+		for _, child in ipairs(children) do
+			local lname = child.Name:lower()
+			if
+				child:IsA("ScreenGui")
+				and child ~= gui
+				and (lname:find("topbar", 1, true) or lname:find("top_bar", 1, true) or lname:find("unibar", 1, true))
+			then
+				found[#found + 1] = child
+			end
+		end
+		return found, children
 	end
 
 	local function applyHidden()
-		local g = realGui()
-		if g then
-			if realOriginal == nil then
-				realOriginal = g.Enabled
+		local list, children = findRealTopbars()
+		local names = {}
+		local stillOn = {}
+		for _, g in ipairs(list) do
+			names[#names + 1] = g.Name
+			if hidden[g] == nil then
+				hidden[g] = isEnabled(g)
+				-- if Roblox turns it back on, turn it off again
+				pcall(function()
+					hiddenConns[#hiddenConns + 1] = g:GetPropertyChangedSignal("Enabled"):Connect(function()
+						if enforceHidden and isEnabled(g) then
+							pcall(function()
+								g.Enabled = false
+							end)
+						end
+					end)
+				end)
 			end
-			hiddenByUs = true
-			if g.Enabled then
+			if isEnabled(g) then
 				pcall(function()
 					g.Enabled = false
 				end)
 			end
-			if realHooked ~= g then
-				if realConn then
-					realConn:Disconnect()
-				end
-				realHooked = g
-				realConn = g:GetPropertyChangedSignal("Enabled"):Connect(function()
-					if enforceHidden and g.Enabled then
-						pcall(function()
-							g.Enabled = false
-						end)
-					end
-				end)
+			if isEnabled(g) then
+				stillOn[#stillOn + 1] = g.Name
 			end
-		elseif not usedSetCore then
-			-- fallback for clients where the gui isn't found
+		end
+
+		-- older clients also honour this
+		if not usedSetCore then
 			usedSetCore = true
-			hiddenByUs = true
 			pcall(function()
 				StarterGui:SetCore("TopbarEnabled", false)
 			end)
+		end
+
+		if #list > 0 then
+			if #stillOn == 0 then
+				setRealStatus("Real topbar: hidden (" .. table.concat(names, ", ") .. ")")
+			else
+				setRealStatus("Real topbar: could not disable " .. table.concat(stillOn, ", "))
+			end
+		elseif children == nil then
+			setRealStatus("Real topbar: can't read CoreGui, only asked Roblox to hide it")
+		else
+			setRealStatus("Real topbar: not found in CoreGui, only asked Roblox to hide it")
+			if not loggedChildren then
+				loggedChildren = true
+				local list2 = {}
+				for _, c in ipairs(children) do
+					list2[#list2 + 1] = c.Name
+				end
+				warn("[Toolx] topbar not found, CoreGui contains: " .. table.concat(list2, ", "))
+			end
 		end
 	end
 
 	local function setRealVisible(visible)
 		enforceHidden = not visible
 		if visible then
-			if realConn then
-				realConn:Disconnect()
-				realConn = nil
+			for _, c in ipairs(hiddenConns) do
+				c:Disconnect()
 			end
-			realHooked = nil
-			if hiddenByUs then
-				hiddenByUs = false
-				local g = realGui()
-				if g then
-					pcall(function()
-						g.Enabled = (realOriginal ~= false)
-					end)
-				end
-				if usedSetCore then
-					usedSetCore = false
-					pcall(function()
-						StarterGui:SetCore("TopbarEnabled", true)
-					end)
-				end
+			table.clear(hiddenConns)
+			for g, was in pairs(hidden) do
+				pcall(function()
+					g.Enabled = was
+				end)
 			end
+			table.clear(hidden)
+			if usedSetCore then
+				usedSetCore = false
+				pcall(function()
+					StarterGui:SetCore("TopbarEnabled", true)
+				end)
+			end
+			loggedChildren = false
+			setRealStatus("Real topbar: showing")
 		else
 			applyHidden()
 		end
@@ -1976,30 +2054,71 @@ do
 		end)
 	end
 
+	-- is the real menu window showing? (falls back to the MenuIsOpen flag)
 	local function isMenuOpen()
-		local ok, v = pcall(function()
+		local ok, shield = pcall(function()
+			return CoreGui.RobloxGui.SettingsShield
+		end)
+		if ok and shield then
+			local ok2, v = pcall(function()
+				return shield.Visible
+			end)
+			if ok2 and type(v) == "boolean" then
+				return v
+			end
+		end
+		local ok3, flag = pcall(function()
 			return GuiService.MenuIsOpen
 		end)
-		return ok and v == true
+		return ok3 and flag == true
+	end
+
+	-- true when we can actually see the menu window (so a "no change" result is believable)
+	local function canSeeMenuWindow()
+		local ok, shield = pcall(function()
+			return CoreGui.RobloxGui.SettingsShield
+		end)
+		return ok and shield ~= nil
 	end
 
 	local function toggleMenu()
 		local before = isMenuOpen()
+		local want = not before
 		local function changed()
-			task.wait(0.2)
+			task.wait(0.3)
 			return isMenuOpen() ~= before
 		end
-		if pcall(function()
-			GuiService:SetMenuIsOpen(not before)
-		end) and changed() then
+		local notes = {}
+
+		-- 1) Roblox's own settings menu module
+		local ok, err = pcall(function()
+			require(CoreGui.RobloxGui.Modules.Settings.SettingsHub):SetVisibility(want)
+		end)
+		if ok and (changed() or not canSeeMenuWindow()) then
+			-- if the window can't be seen we can't confirm, but the call worked, so don't also press Escape
+			setActionStatus("Menu: " .. (want and "opened" or "closed") .. " (SettingsHub)")
 			return
 		end
-		if pcall(function()
-			require(CoreGui.RobloxGui.Modules.Settings.SettingsHub):ToggleVisibility()
-		end) and changed() then
+		notes[#notes + 1] = "SettingsHub " .. (ok and "no change" or tostring(err):sub(1, 40))
+
+		-- 2) the Escape key
+		if sendKey(Enum.KeyCode.Escape) and (changed() or not canSeeMenuWindow()) then
+			setActionStatus("Menu: " .. (want and "opened" or "closed") .. " (Escape key)")
 			return
 		end
-		sendKey(Enum.KeyCode.Escape)
+		notes[#notes + 1] = VIM and "Escape key no change" or "no VirtualInputManager"
+
+		-- 3) the MenuIsOpen flag
+		local ok3 = pcall(function()
+			GuiService:SetMenuIsOpen(want)
+		end)
+		if ok3 and changed() then
+			setActionStatus("Menu: " .. (want and "opened" or "closed") .. " (SetMenuIsOpen)")
+			return
+		end
+		notes[#notes + 1] = "SetMenuIsOpen " .. (ok3 and "no change" or "failed")
+
+		setActionStatus("Menu: nothing worked (" .. table.concat(notes, ", ") .. ")")
 	end
 
 	local chatState = true
@@ -2101,6 +2220,28 @@ do
 		invState = not invState
 	end
 
+	-- report what each button did, so a button that does nothing is easy to spot
+	do
+		local rawChat, rawList, rawEmotes, rawInventory = toggleChat, togglePlayerList, toggleEmotes, toggleInventory
+		toggleChat = function()
+			rawChat()
+			setActionStatus("Chat: " .. (chatVisible() and "shown" or "hidden"))
+		end
+		togglePlayerList = function()
+			rawList()
+			setActionStatus("Leaderboard: " .. (playerListOn() and "on" or "off"))
+		end
+		toggleEmotes = function()
+			rawEmotes()
+			task.wait(0.2)
+			setActionStatus("Emotes: " .. (emotesOpen() and "open" or "closed"))
+		end
+		toggleInventory = function()
+			rawInventory()
+			setActionStatus("Inventory: " .. (inventoryOpen() and "open" or "closed or unknown"))
+		end
+	end
+
 	-- unread chat counter
 	local unread = 0
 	local function trackUnread(setBadge)
@@ -2193,13 +2334,7 @@ do
 		styleToken = styleToken + 1
 		local token = styleToken
 
-		local root = mk("Frame", {
-			Name = "Topbar2018",
-			Size = UDim2.fromScale(1, 1),
-			BackgroundTransparency = 1,
-			ZIndex = 1,
-			Parent = ensureGui(),
-		})
+		local root, ui = scaledRoot("Topbar2018")
 		local bar = mk("Frame", {
 			Name = "TopBarContainer",
 			Size = UDim2.new(1, 0, 0, 36),
@@ -2227,6 +2362,14 @@ do
 			Parent = shadow,
 		})
 
+		-- the hamburger and chat sit a bit in from the screen edge
+		local left = mk("Frame", {
+			Name = "Left",
+			Size = UDim2.new(0, 100, 1, 0),
+			Position = UDim2.fromOffset(20, 0),
+			BackgroundTransparency = 1,
+			Parent = bar,
+		})
 		local function slot(name, x)
 			return mk("TextButton", {
 				Name = name,
@@ -2235,7 +2378,7 @@ do
 				BackgroundTransparency = 1,
 				Text = "",
 				AutoButtonColor = false,
-				Parent = bar,
+				Parent = left,
 			})
 		end
 
@@ -2410,7 +2553,7 @@ do
 			end
 		end
 		refresh()
-		return { root = root, refresh = refresh }
+		return { root = root, ui = ui, refresh = refresh }
 	end
 
 	------------------------------------------------------------------
@@ -2428,13 +2571,7 @@ do
 		styleToken = styleToken + 1
 		local token = styleToken
 
-		local root = mk("Frame", {
-			Name = "Topbar2021",
-			Size = UDim2.fromScale(1, 1),
-			BackgroundTransparency = 1,
-			ZIndex = 1,
-			Parent = ensureGui(),
-		})
+		local root, ui = scaledRoot("Topbar2021")
 
 		local function circle(name, position, anchor)
 			local b = mk("TextButton", {
@@ -2626,7 +2763,7 @@ do
 			end
 		end
 		refresh()
-		return { root = root, refresh = refresh }
+		return { root = root, ui = ui, refresh = refresh }
 	end
 
 	------------------------------------------------------------------
@@ -2674,6 +2811,15 @@ do
 			setRealVisible(false)
 			style = (name == "2018") and build2018() or build2021()
 			ensureLoop()
+		end
+	end
+
+	-- percent: 100 = original size
+	function Topbar.SetScale(percent)
+		uiScale = math.clamp(percent, 50, 300) / 100
+		if style and style.ui and style.root then
+			style.ui.Scale = uiScale
+			style.root.Size = UDim2.fromScale(1 / uiScale, 1 / uiScale)
 		end
 	end
 
@@ -3275,7 +3421,16 @@ worldTab:Section("Topbar")
 worldTab:Choice("Topbar style", { "2018", "2021", "Current" }, "Current", function(name)
 	Topbar.Set(name)
 end, "world.topbar")
-worldTab:Label("2018 and 2021 swap Roblox's topbar for a working copy that reaches the screen edges. Current is Roblox's real topbar: it is hidden while a copy is shown and comes back when you pick Current or close Toolx.")
+worldTab:Slider("Topbar size (%)", 80, 200, 130, function(v)
+	Topbar.SetScale(v)
+end, "world.topbarSize")
+local topbarStatus = worldTab:Label("Real topbar: untouched")
+Topbar.OnStatus = function(text)
+	if topbarStatus.Parent then
+		topbarStatus.Text = text
+	end
+end
+worldTab:Label("2018 and 2021 swap Roblox's topbar for a working copy that reaches the screen edges. Current is Roblox's real topbar: it is hidden while a copy is shown and comes back when you pick Current or close Toolx. The two lines above say whether the real topbar was hidden and what the last button you pressed did.")
 
 worldTab:Section("Explorer")
 

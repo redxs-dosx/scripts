@@ -2062,6 +2062,59 @@ hoverable(repeatBtn, Theme.Element, Theme.Hover)
 hoverable(closeBtn, Theme.Element, Color3.fromRGB(200, 60, 60))
 hoverable(minBtn, Theme.Element, Theme.Hover)
 
+-- ========= Playback speed (0.5x / 1x / 1.5x / 2x) =========
+local SPEEDS = { { 0.5, "0.5x" }, { 1, "1x" }, { 1.5, "1.5x" }, { 2, "2x" } }
+
+local speedBar = create("Frame", {
+    Name = "Speed",
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -14, 1, -14),
+    Size = UDim2.fromOffset(4 * 40 + 3 * 6, 24),
+    BackgroundTransparency = 1,
+}, {
+    create("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 6),
+    }),
+})
+speedBar.Parent = player
+
+local speedChips = {}
+
+local function refreshSpeedChips(active)
+    for _, c in ipairs(speedChips) do
+        local on = (c.value == active)
+        tween(c.btn, 0.2, {
+            BackgroundColor3 = on and Theme.Accent or Theme.Element,
+            TextColor3 = on and Theme.Sidebar or Theme.Text,
+        })
+    end
+end
+
+for i, s in ipairs(SPEEDS) do
+    local btn = create("TextButton", {
+        Name = "Speed_" .. s[2],
+        LayoutOrder = i,
+        Size = UDim2.fromOffset(40, 24),
+        BackgroundColor3 = Theme.Element,
+        BackgroundTransparency = 0.2,
+        Text = s[2],
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = Theme.Text,
+        AutoButtonColor = false,
+    }, { corner(UDim.new(1, 0)) })
+    btn.Parent = speedBar
+    speedChips[#speedChips + 1] = { btn = btn, value = s[1] }
+    btn.MouseButton1Click:Connect(function()
+        sound.PlaybackSpeed = s[1]
+        refreshSpeedChips(s[1])
+    end)
+end
+refreshSpeedChips(1)
+
 -- Squish-on-press for every button
 local function pressable(btn)
     local s = create("UIScale", { Scale = 1 })
@@ -2077,6 +2130,9 @@ local function pressable(btn)
 end
 for _, b in ipairs({ playBtn, prevBtn, nextBtn, shuffleBtn, repeatBtn, refreshBtn, minBtn, closeBtn, pillPlay }) do
     pressable(b)
+end
+for _, c in ipairs(speedChips) do
+    pressable(c.btn)
 end
 
 -- ========= Minimize (to pill) / Restore / Close =========

@@ -1657,6 +1657,7 @@ do
 	local saved = {}
 	local steppedConn, heartConn
 	local lastSafeCF
+	local pauseCount = 0 -- >0 while our own fling is running (anti-fling must not fight it)
 
 	local partCache, cacheTime = {}, 0
 
@@ -1682,7 +1683,7 @@ do
 
 	-- Anti-fling part 1: other players' parts never collide with you
 	local function onStepped()
-		if not state.fling then
+		if not state.fling or pauseCount > 0 then
 			return
 		end
 		local now = os.clock()
@@ -1717,7 +1718,7 @@ do
 		end
 
 		-- Anti-fling part 2: cancel crazy velocities and snap back to the last safe spot
-		if state.fling then
+		if state.fling and pauseCount == 0 then
 			local lv = root.AssemblyLinearVelocity
 			local av = root.AssemblyAngularVelocity
 			local horizontal = Vector3.new(lv.X, 0, lv.Z).Magnitude
@@ -1791,6 +1792,13 @@ do
 
 	function Mods.SetJumpValue(v)
 		values.jump = v
+	end
+
+	function Mods.Pause(on)
+		pauseCount = math.max(0, pauseCount + (on and 1 or -1))
+		if pauseCount == 0 then
+			lastSafeCF = nil
+		end
 	end
 
 	function Mods.SetAntiFling(on)
@@ -1901,22 +1909,31 @@ do
 	-- How long we spin into the target before giving up.
 	local FLING_DURATION = 3.0
 
-	-- Ported from Infinite Yield's 'fling' command.
+	-- Positions (relative to the target's root) we cycle through while spinning.
+	local FLING_OFFSETS = {
+		Vector3.new(0, 1.5, 0),
+		Vector3.new(0, -1.5, 0),
+		Vector3.new(2.25, 1.5, -2.25),
+		Vector3.new(-2.25, -1.5, 2.25),
+	}
+
+	-- Infinite Yield style fling, fixed so that the TARGET gets launched and not us.
 	--
-	-- How it works:
-	--   1. Make every part of YOUR character Massless + CanCollide=false so
-	--      the spin doesn't throw YOU around.
-	--   2. Attach a BodyAngularVelocity (99999 Y-axis) to your root.
-	--      This makes you spin at extreme speed client-side.
-	--   3. Teleport your root onto the target every Heartbeat while the BAV
-	--      is live.  The server sees a rapidly-spinning character occupying
-	--      the same space as the target and resolves the contact — launching
-	--      the target (not you, because you're Massless).
-	--   4. On exit: destroy the BAV, restore CanCollide / Massless,
-	--      reset PhysicalProperties.
+	-- What was wrong before:
+	--   * Our parts were set to Massless, which cancels the huge density and made us light, so
+	--     the contact threw us instead of them.
+	--   * Humanoids re-enable CanCollide every physics step, so noclip has to be re-applied
+	--     each Stepped, not just once.
+	--   * Anti-fling (if on) saw our spin as an attack and snapped us around mid-fling.
+	--   * On the way back we kept all of our spin/velocity and then turned collisions on
+	--     again, which launched us into the map.
+	--
+	-- Now: huge density (NOT massless) + per-step noclip + spin on the target, then on exit we
+	-- go back to `origin` and keep every part's velocity at zero (still noclipped) until
+	-- everything has settled, and only then restore collisions and physical properties.
 	--
 	-- Returns true if the target appeared to gain significant height.
-	local function doFling(target)
+	local function doFling(target, origin)
 		local myChar = player.Character
 		local myRoot = getRoot(myChar)
 		if not myRoot then
@@ -1927,24 +1944,49 @@ do
 			return false
 		end
 
-		local baseY    = targetRoot.Position.Y
+		local baseY     = targetRoot.Position.Y
 		local startTime = os.clock()
-		local flung    = false
+		local flung     = false
+		origin = origin or myRoot.CFrame
 
-		-- ── setup ────────────────────────────────────────────────────
-		-- Make our parts light / non-colliding so the spin doesn't move us
+		Mods.Pause(true)
+
+		-- remember how everything was so we can put it back exactly
+		local parts, originals = {}, {}
 		for _, part in ipairs(myChar:GetDescendants()) do
 			if part:IsA("BasePart") then
+				table.insert(parts, part)
+				originals[part] = {
+					props    = part.CustomPhysicalProperties,
+					collide  = part.CanCollide,
+					massless = part.Massless,
+				}
 				pcall(function()
-					part.CustomPhysicalProperties = PhysicalProperties.new(
-						math.huge, 0.3, 0.5)
-					part.CanCollide = false
-					part.Massless   = true
+					-- very heavy so the spin pushes the target, not us (do NOT make it massless)
+					part.CustomPhysicalProperties = PhysicalProperties.new(math.huge, 0.3, 0.5)
 				end)
 			end
 		end
 
-		-- Disable humanoid states so we don't ragdoll
+		local function zeroVelocity()
+			for _, part in ipairs(parts) do
+				pcall(function()
+					part.AssemblyLinearVelocity  = Vector3.zero
+					part.AssemblyAngularVelocity = Vector3.zero
+				end)
+			end
+		end
+
+		-- noclip on every physics step (the humanoid keeps turning collisions back on)
+		local noclipConn = RunService.Stepped:Connect(function()
+			for _, part in ipairs(parts) do
+				if part.CanCollide then
+					part.CanCollide = false
+				end
+			end
+		end)
+
+		-- don't ragdoll / fall over from the spin
 		local myHum = myChar:FindFirstChildOfClass("Humanoid")
 		if myHum then
 			pcall(function()
@@ -1953,40 +1995,45 @@ do
 			end)
 		end
 
-		-- Attach the spinning force (the key ingredient)
+		-- the spinning force
 		local bav = Instance.new("BodyAngularVelocity")
-		bav.Name          = "ToolxFlingBAV"
+		bav.Name            = "ToolxFlingBAV"
 		bav.AngularVelocity = Vector3.new(0, 99999, 0)
 		bav.MaxTorque       = Vector3.new(0, math.huge, 0)
 		bav.P               = math.huge
 		bav.Parent          = myRoot
 
 		-- ── spin loop ────────────────────────────────────────────────
+		local frame = 0
 		local conn
 		conn = RunService.Heartbeat:Connect(function()
 			local elapsed = os.clock() - startTime
 
-			if elapsed >= FLING_DURATION or not target.Parent or not target.Character then
+			if elapsed >= FLING_DURATION or not target.Parent or not target.Character
+				or player.Character ~= myChar then
 				conn:Disconnect()
 				return
 			end
 
 			local tr = getRoot(target.Character)
-			local mr = getRoot(player.Character)
-			if not tr or not mr then
+			if not tr or not myRoot.Parent then
 				conn:Disconnect()
 				return
 			end
 
-			-- Teleport ourselves onto the target so the spin hits them
+			frame += 1
+			local offset = FLING_OFFSETS[frame % #FLING_OFFSETS + 1]
+
+			-- sit on the target (slightly ahead of where they're moving) so the spin hits them,
+			-- and never let our own linear velocity build up
 			pcall(function()
-				player.Character:PivotTo(tr.CFrame)
+				myChar:PivotTo(CFrame.new(tr.Position + tr.AssemblyLinearVelocity * 0.1 + offset))
+				myRoot.AssemblyLinearVelocity = Vector3.zero
 			end)
 
-			-- Alternate the spin direction each 0.2 s (same rhythm as IY)
-			-- to stop the server from settling the two bodies together
+			-- alternate the spin each 0.2 s so the server doesn't settle the two bodies together
 			local phase = math.floor(elapsed / 0.2) % 2
-			if bav and bav.Parent then
+			if bav.Parent then
 				bav.AngularVelocity = Vector3.new(0, phase == 0 and 99999 or 0, 0)
 			end
 
@@ -2003,29 +2050,43 @@ do
 		until not conn.Connected or os.clock() >= deadline
 		if conn.Connected then conn:Disconnect() end
 
-		-- ── teardown ─────────────────────────────────────────────────
-		if bav and bav.Parent then
-			bav:Destroy()
+		-- ── teardown: get away from the target and stop dead ─────────
+		bav:Destroy()
+
+		-- Hold still at the origin (still noclipped, still heavy) while all leftover spin /
+		-- momentum is killed every frame. Only then do collisions come back.
+		local settleUntil = os.clock() + 0.6
+		repeat
+			pcall(function()
+				myChar:PivotTo(origin)
+			end)
+			zeroVelocity()
+			RunService.Heartbeat:Wait()
+		until os.clock() >= settleUntil
+
+		noclipConn:Disconnect()
+
+		for _, part in ipairs(parts) do
+			local o = originals[part]
+			pcall(function()
+				part.CustomPhysicalProperties = o.props
+				part.Massless                 = o.massless
+				part.CanCollide               = o.collide
+			end)
+		end
+		for _ = 1, 3 do
+			zeroVelocity()
+			RunService.Heartbeat:Wait()
 		end
 
-		-- Restore parts
-		for _, part in ipairs(myChar:GetDescendants()) do
-			if part:IsA("BasePart") then
-				pcall(function()
-					part.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.3, 0.5)
-					part.CanCollide = true
-					part.Massless   = false
-				end)
-			end
-		end
-
-		-- Restore humanoid states
 		if myHum then
 			pcall(function()
 				myHum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
 				myHum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll,      true)
 			end)
 		end
+
+		Mods.Pause(false)
 
 		-- Final height check as fallback
 		local tr = getRoot(target.Character)
@@ -2056,13 +2117,8 @@ do
 		local origin = myRoot.CFrame
 		notify("Flinging " .. target.DisplayName .. "...", "info")
 
-		local success = doFling(target)
-
-		-- Small grace period so the velocity keeps carrying them before we jump away.
-		-- keepVelocity=true so we don't kill our own momentum mid-transfer (the server
-		-- still resolves the collision on its side for another tick or two after we move).
-		task.wait(0.25)
-		moveTo(origin, true)
+		-- doFling takes us back to `origin` and kills our velocity before returning
+		local success = doFling(target, origin)
 
 		if success then
 			notify("Flung " .. target.DisplayName .. "!", "success")
@@ -2107,10 +2163,9 @@ do
 				notify(target.DisplayName .. " isn't loaded, skipping", "warn")
 				failed += 1
 			else
-				local success = doFling(target)
-				task.wait(0.25)    -- grace period before we leave
-				moveTo(origin, true) -- keepVelocity so we don't cut the transfer short
-				task.wait(0.15)    -- settle before next target
+				-- doFling returns us to origin with zero velocity before it finishes
+				local success = doFling(target, origin)
+				task.wait(0.1)
 
 				if success then
 					done += 1

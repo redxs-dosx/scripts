@@ -5291,7 +5291,7 @@ utilityTab:Label("Raises Roblox's frame rate limit. Turning it off puts the limi
 ---------------------------------------------------------------------
 local scannerTab = addTab("Scanner")
 scannerTab:Section("Backdoor Scanner")
-scannerTab:Label("Scans ReplicatedStorage and Workspace for responsive remotes.")
+scannerTab:Label("Scans ReplicatedStorage and Workspace for responsive remotes. Tap any discovered remote to fire it.")
 
 local scanResultsBox = scannerTab:LogBox(180, 50, "No scan performed yet")
 
@@ -5323,11 +5323,26 @@ scannerTab:Button("Run Scan", function(lbl)
 						end)
 						if ok then
 							count += 1
-							scanResultsBox.Add(string.format(
-								'<font color="#4cc978">%s</font> (%s)',
-								escapeRich(descendant.Name),
-								escapeRich(descendant.ClassName)
-							))
+							local remoteObj = descendant
+							scanResultsBox.Add(
+								string.format('<font color="#4cc978">%s</font> (%s)', escapeRich(remoteObj.Name), escapeRich(remoteObj.ClassName)),
+								function()
+									local fireOk = pcall(function()
+										if remoteObj:IsA("RemoteEvent") then
+											remoteObj:FireServer("Toolx Manual Fire")
+										elseif remoteObj:IsA("RemoteFunction") then
+											remoteObj:InvokeServer("Toolx Manual Fire")
+										end
+									end)
+									if fireOk then
+										notify("Successfully fired: " .. remoteObj.Name, "success")
+										return "Fired!"
+									else
+										notify("Failed to fire: " .. remoteObj.Name, "error")
+										return "Error"
+									end
+								end
+							)
 							break
 						end
 					end

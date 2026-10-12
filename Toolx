@@ -5297,7 +5297,7 @@ scannerTab:Label("Scans ReplicatedStorage and Workspace for responsive remotes. 
 local scanResultsBox = scannerTab:LogBox(140, 40, "No scan performed yet")
 
 scannerTab:Section("Payload Arguments")
-scannerTab:Label("Add custom arguments to send when firing discovered remotes.")
+scannerTab:Label("Add custom arguments (String, Number, Boolean, Instance, Table) to send when firing remotes.")
 
 local argRowsContainer = scannerTab:Container()
 new("UIListLayout", {
@@ -5306,6 +5306,40 @@ new("UIListLayout", {
 }, argRowsContainer)
 
 local customArgsList = {}
+
+-- Helper to resolve instance paths like "game.Players.LocalPlayer" or "workspace.Part"
+local function resolveInstance(path)
+	if not path or path == "" then return player end
+	local lower = path:lower()
+	if lower == "me" or lower == "player" or lower == "localplayer" then return player end
+	if lower == "character" or "char" then return player.Character end
+	if lower == "workspace" then return workspace end
+	
+	local current = game
+	for part in path:gmatch("[^%.]+") do
+		if current then
+			current = current:FindFirstChild(part) or current[part]
+		end
+	end
+	return current or workspace
+end
+
+-- Helper to parse tables from JSON or comma-separated lists
+local function resolveTable(text)
+	if not text or text == "" then return {} end
+	local ok, res = pcall(function()
+		return HttpService:JSONDecode(text)
+	end)
+	if ok and typeof(res) == "table" then
+		return res
+	end
+	local t = {}
+	for item in text:gmatch("[^,%s]+") do
+		local num = tonumber(item)
+		table.insert(t, num or item)
+	end
+	return t
+end
 
 local function renderArgRows()
 	for _, c in ipairs(argRowsContainer:GetChildren()) do
@@ -5325,7 +5359,7 @@ local function renderArgRows()
 		corner(r, 8)
 		stroke(r, 0.94)
 		
-		-- Type choice button/label
+		-- Type selector button
 		local typeBtn = new("TextButton", {
 			Text = argData.type,
 			Font = Enum.Font.GothamBold,
@@ -5335,7 +5369,7 @@ local function renderArgRows()
 			BackgroundColor3 = theme.off,
 			BorderSizePixel = 0,
 			Position = UDim2.new(0, 8, 0.5, -14),
-			Size = UDim2.fromOffset(72, 28),
+			Size = UDim2.fromOffset(80, 28),
 		}, r)
 		corner(typeBtn, 6)
 		
@@ -5344,6 +5378,10 @@ local function renderArgRows()
 				argData.type = "Number"
 			elseif argData.type == "Number" then
 				argData.type = "Boolean"
+			elseif argData.type == "Boolean" then
+				argData.type = "Instance"
+			elseif argData.type == "Instance" then
+				argData.type = "Table"
 			else
 				argData.type = "String"
 			end
@@ -5353,7 +5391,7 @@ local function renderArgRows()
 		-- Value input box
 		local valBox = new("TextBox", {
 			Text = argData.val,
-			PlaceholderText = "Value...",
+			PlaceholderText = "Value / Path / JSON...",
 			PlaceholderColor3 = theme.dim,
 			ClearTextOnFocus = false,
 			Font = Enum.Font.Gotham,
@@ -5363,8 +5401,8 @@ local function renderArgRows()
 			BackgroundColor3 = theme.surface,
 			BackgroundTransparency = 0.5,
 			BorderSizePixel = 0,
-			Position = UDim2.new(0, 88, 0.5, -14),
-			Size = UDim2.new(1, -132, 0, 28),
+			Position = UDim2.new(0, 96, 0.5, -14),
+			Size = UDim2.new(1, -140, 0, 28),
 		}, r)
 		corner(valBox, 6)
 		new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, valBox)
@@ -5408,8 +5446,12 @@ local function getBuiltArguments()
 			table.insert(args, tonumber(item.val) or 0)
 		elseif item.type == "Boolean" then
 			table.insert(args, item.val:lower() == "true")
+		elseif item.type == "Instance" then
+			table.insert(args, resolveInstance(item.val))
+		elseif item.type == "Table" then
+			table.insert(args, resolveTable(item.val))
 		end
-	end
+	}
 	if #args == 0 then
 		table.insert(args, "Toolx Manual Fire")
 	end

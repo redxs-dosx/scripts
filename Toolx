@@ -1819,7 +1819,9 @@ do
 		return char and char:FindFirstChild("HumanoidRootPart")
 	end
 
-	local function moveTo(cf)
+	-- keepVelocity = true: skip zeroing velocity (used when returning to origin after a fling
+	-- so our own momentum doesn't get cancelled before the server registers the collision)
+	local function moveTo(cf, keepVelocity)
 		local char = player.Character
 		local root = getRoot(char)
 		if not root then
@@ -1828,8 +1830,10 @@ do
 		pcall(function()
 			char:PivotTo(cf)
 		end)
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
+		if not keepVelocity then
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		end
 		return true
 	end
 
@@ -1891,36 +1895,27 @@ do
 	end
 
 	---------------------------------------------------------------------
-	-- Fling helpers
+	-- Fling helpers  (IY-style: BodyAngularVelocity spin + noclip)
 	---------------------------------------------------------------------
 
-	-- How long (seconds) we keep ramming into the target.
-	-- 3 s is reliable; lower if you want faster all-fling loops.
+	-- How long we spin into the target before giving up.
 	local FLING_DURATION = 3.0
 
-	-- Core fling routine.
+	-- Ported from Infinite Yield's 'fling' command.
 	--
-	-- Why every other approach failed:
-	--   Writing AssemblyLinearVelocity or creating a Seat on the TARGET's
-	--   character does nothing from an executor.  The target's character is
-	--   owned by the server (or by the target's own client), so the server
-	--   discards any physics writes we make to their parts immediately.
+	-- How it works:
+	--   1. Make every part of YOUR character Massless + CanCollide=false so
+	--      the spin doesn't throw YOU around.
+	--   2. Attach a BodyAngularVelocity (99999 Y-axis) to your root.
+	--      This makes you spin at extreme speed client-side.
+	--   3. Teleport your root onto the target every Heartbeat while the BAV
+	--      is live.  The server sees a rapidly-spinning character occupying
+	--      the same space as the target and resolves the contact — launching
+	--      the target (not you, because you're Massless).
+	--   4. On exit: destroy the BAV, restore CanCollide / Massless,
+	--      reset PhysicalProperties.
 	--
-	-- What actually works — collision transfer:
-	--   YOUR character IS owned by your client, so PivotTo and velocity
-	--   writes on your own root DO replicate to the server.  The trick is:
-	--     1. Teleport your root inside the target's root every Heartbeat.
-	--     2. Set your OWN root's velocity to a large upward vector each step.
-	--     3. The server sees two characters occupying the same space with one
-	--        moving fast, resolves the collision, and transfers momentum to
-	--        the target — sending them flying.
-	--
-	-- Detection:
-	--   We watch the target's Y position (readable from any client) and stop
-	--   early once they are clearly airborne.  This is more reliable than
-	--   reading their velocity, which can appear near-zero mid-flight.
-	--
-	-- Returns true if the target appeared to leave the ground.
+	-- Returns true if the target appeared to gain significant height.
 	local function doFling(target)
 		local myChar = player.Character
 		local myRoot = getRoot(myChar)
@@ -1935,17 +1930,39 @@ do
 		local baseY    = targetRoot.Position.Y
 		local startTime = os.clock()
 		local flung    = false
-		local conn
 
-		-- Disable our humanoid state so we don't get knocked over ourselves
+		-- ── setup ────────────────────────────────────────────────────
+		-- Make our parts light / non-colliding so the spin doesn't move us
+		for _, part in ipairs(myChar:GetDescendants()) do
+			if part:IsA("BasePart") then
+				pcall(function()
+					part.CustomPhysicalProperties = PhysicalProperties.new(
+						math.huge, 0.3, 0.5)
+					part.CanCollide = false
+					part.Massless   = true
+				end)
+			end
+		end
+
+		-- Disable humanoid states so we don't ragdoll
 		local myHum = myChar:FindFirstChildOfClass("Humanoid")
 		if myHum then
 			pcall(function()
 				myHum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-				myHum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+				myHum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll,      false)
 			end)
 		end
 
+		-- Attach the spinning force (the key ingredient)
+		local bav = Instance.new("BodyAngularVelocity")
+		bav.Name          = "ToolxFlingBAV"
+		bav.AngularVelocity = Vector3.new(0, 99999, 0)
+		bav.MaxTorque       = Vector3.new(0, math.huge, 0)
+		bav.P               = math.huge
+		bav.Parent          = myRoot
+
+		-- ── spin loop ────────────────────────────────────────────────
+		local conn
 		conn = RunService.Heartbeat:Connect(function()
 			local elapsed = os.clock() - startTime
 
@@ -1961,39 +1978,52 @@ do
 				return
 			end
 
-			-- Step 1: teleport ourselves into the target's root this frame
+			-- Teleport ourselves onto the target so the spin hits them
 			pcall(function()
 				player.Character:PivotTo(tr.CFrame)
 			end)
 
-			-- Step 2: blast OUR velocity upward — this is what the server sees
-			-- and what transfers to the target via collision resolution
-			pcall(function()
-				mr.AssemblyLinearVelocity = Vector3.new(0, 500, 0)
-			end)
+			-- Alternate the spin direction each 0.2 s (same rhythm as IY)
+			-- to stop the server from settling the two bodies together
+			local phase = math.floor(elapsed / 0.2) % 2
+			if bav and bav.Parent then
+				bav.AngularVelocity = Vector3.new(0, phase == 0 and 99999 or 0, 0)
+			end
 
-			-- Step 3: check if the target has gained significant height (flung)
-			if (tr.Position.Y - baseY) >= 25 then
+			-- Early exit once the target is clearly airborne
+			if (tr.Position.Y - baseY) >= 15 then
 				flung = true
 				conn:Disconnect()
 			end
 		end)
 
-		-- Block until the loop exits
+		-- Block until the loop finishes
 		local deadline = os.clock() + FLING_DURATION + 0.5
-		repeat
-			task.wait(0.05)
+		repeat task.wait(0.05)
 		until not conn.Connected or os.clock() >= deadline
+		if conn.Connected then conn:Disconnect() end
 
-		if conn.Connected then
-			conn:Disconnect()
+		-- ── teardown ─────────────────────────────────────────────────
+		if bav and bav.Parent then
+			bav:Destroy()
+		end
+
+		-- Restore parts
+		for _, part in ipairs(myChar:GetDescendants()) do
+			if part:IsA("BasePart") then
+				pcall(function()
+					part.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.3, 0.5)
+					part.CanCollide = true
+					part.Massless   = false
+				end)
+			end
 		end
 
 		-- Restore humanoid states
 		if myHum then
 			pcall(function()
 				myHum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
-				myHum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+				myHum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll,      true)
 			end)
 		end
 
@@ -2028,9 +2058,11 @@ do
 
 		local success = doFling(target)
 
-		-- Small grace period so the velocity keeps carrying them before we jump away
+		-- Small grace period so the velocity keeps carrying them before we jump away.
+		-- keepVelocity=true so we don't kill our own momentum mid-transfer (the server
+		-- still resolves the collision on its side for another tick or two after we move).
 		task.wait(0.25)
-		moveTo(origin)
+		moveTo(origin, true)
 
 		if success then
 			notify("Flung " .. target.DisplayName .. "!", "success")
@@ -2077,7 +2109,7 @@ do
 			else
 				local success = doFling(target)
 				task.wait(0.25)    -- grace period before we leave
-				moveTo(origin)
+				moveTo(origin, true) -- keepVelocity so we don't cut the transfer short
 				task.wait(0.15)    -- settle before next target
 
 				if success then

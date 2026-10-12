@@ -5451,7 +5451,7 @@ local function getBuiltArguments()
 		elseif item.type == "Table" then
 			table.insert(args, resolveTable(item.val))
 		end
-	}
+	end
 	if #args == 0 then
 		table.insert(args, "Toolx Manual Fire")
 	end

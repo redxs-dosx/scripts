@@ -26,6 +26,7 @@ local RunService = game:GetService("RunService")
 local StarterGui = game:GetService("StarterGui")
 local LogService = game:GetService("LogService")
 local Stats = game:GetService("Stats")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
 
@@ -107,7 +108,6 @@ local capturingKey = false -- true while a Keybind row is waiting for a key pres
 ---------------------------------------------------------------------
 -- Saved options ("Keep options" setting)
 ---------------------------------------------------------------------
-local HttpService = game:GetService("HttpService")
 local SAVE_FOLDER = "Toolx"
 local SAVE_FILE = "Toolx/options.json"
 
@@ -1287,9 +1287,6 @@ local function addTab(name)
 end
 
 ---------------------------------------------------------------------
--- Tabs (placeholder content, functionality comes next)
----------------------------------------------------------------------
----------------------------------------------------------------------
 -- Desync module (client box vs server box, freeze client / server)
 ---------------------------------------------------------------------
 local Desync = {}
@@ -1808,6 +1805,89 @@ do
 		Mods.SetWalk(false)
 		Mods.SetJump(false)
 		Mods.SetAntiFling(false)
+	end
+end
+
+---------------------------------------------------------------------
+-- Teleport (to a player, or to a spawn point)
+---------------------------------------------------------------------
+local Teleport = {}
+do
+	local spawnIndex = 0
+
+	local function getRoot(char)
+		return char and char:FindFirstChild("HumanoidRootPart")
+	end
+
+	local function moveTo(cf)
+		local char = player.Character
+		local root = getRoot(char)
+		if not root then
+			return false
+		end
+		pcall(function()
+			char:PivotTo(cf)
+		end)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		return true
+	end
+
+	-- Teleports you just behind the other player
+	function Teleport.ToPlayer(target)
+		if not target or not target.Parent then
+			notify("That player left", "warn")
+			return
+		end
+		local root = getRoot(target.Character)
+		if not root then
+			notify(target.DisplayName .. " isn't loaded yet", "warn")
+			return
+		end
+		if moveTo(root.CFrame * CFrame.new(0, 0, 3)) then
+			notify("Teleported to " .. target.DisplayName, "success")
+		else
+			notify("Your character isn't loaded", "error")
+		end
+	end
+
+	-- Your own respawn location first, then every enabled spawn you could spawn at
+	local function spawnList()
+		local list = {}
+		local mine = player.RespawnLocation
+		if mine and mine.Parent then
+			table.insert(list, mine)
+		end
+		local fallback = {}
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d:IsA("SpawnLocation") and d.Enabled and d ~= mine then
+				table.insert(fallback, d)
+				if d.Neutral or (not player.Neutral and d.TeamColor == player.TeamColor) then
+					table.insert(list, d)
+				end
+			end
+		end
+		-- no spawn fits your team: offer any enabled spawn instead
+		if #list == 0 then
+			list = fallback
+		end
+		return list
+	end
+
+	-- With several spawns, each tap moves you to the next one
+	function Teleport.ToSpawn()
+		local list = spawnList()
+		if #list == 0 then
+			notify("No spawn point found in this game", "warn")
+			return
+		end
+		spawnIndex = spawnIndex % #list + 1
+		local s = list[spawnIndex]
+		if moveTo(s.CFrame + Vector3.new(0, s.Size.Y / 2 + 3, 0)) then
+			notify(#list > 1 and string.format("Teleported to spawn %d/%d", spawnIndex, #list) or "Teleported to spawn", "success")
+		else
+			notify("Your character isn't loaded", "error")
+		end
 	end
 end
 
@@ -3427,7 +3507,7 @@ do
 end
 
 ---------------------------------------------------------------------
--- Console helpers
+-- Shared helpers (clipboard, console, rich text)
 ---------------------------------------------------------------------
 local function copyToClipboard(text)
 	local fn
@@ -3466,10 +3546,21 @@ local function flashLabel(lbl, text)
 	end)
 end
 
+-- Escapes text so it can go inside a RichText label
+local function escapeRich(s)
+	s = s:gsub("&", "&amp;")
+	s = s:gsub("<", "&lt;")
+	s = s:gsub(">", "&gt;")
+	s = s:gsub('"', "&quot;")
+	s = s:gsub("'", "&apos;")
+	return s
+end
+
 ---------------------------------------------------------------------
 -- Remote script runner (Keyboard, Dex)
 ---------------------------------------------------------------------
 local KEYBOARD_URL = "https://raw.githubusercontent.com/AZYsGithub/Delta-Scripts/main/MobileKeyboard.txt"
+local DEX_URL = "https://raw.githubusercontent.com/infyiff/backup/main/dex.lua"
 
 local function fetchUrl(url)
 	local ok, body = pcall(function()
@@ -3814,18 +3905,13 @@ toolsTab:Section("Scripts")
 toolsTab:Button("Keyboard", function(lbl)
 	runRemote(lbl, "Keyboard", KEYBOARD_URL)
 end)
+toolsTab:Button("Execute Dex", function(lbl)
+	runRemote(lbl, "Dex", DEX_URL)
+end)
+toolsTab:Label("Keyboard and Dex (the explorer) load from GitHub. Once one is running, its button won't start a second copy.")
 
 toolsTab:Section("Chat logs")
 local chatBox = toolsTab:LogBox(150, 200)
-
-local function escapeRich(s)
-	s = s:gsub("&", "&amp;")
-	s = s:gsub("<", "&lt;")
-	s = s:gsub(">", "&gt;")
-	s = s:gsub('"', "&quot;")
-	s = s:gsub("'", "&apos;")
-	return s
-end
 
 local function addChatLine(entry)
 	chatBox.Add(string.format(
@@ -3967,6 +4053,47 @@ playerTab:Toggle("Anti-fling", false, function(state)
 	Mods.SetAntiFling(state)
 end, "protect.antifling")
 
+playerTab:Section("Teleport")
+playerTab:Button("Teleport to spawn", function()
+	Teleport.ToSpawn()
+end)
+local playerListBox = playerTab:LogBox(150, 100, "No other players")
+playerTab:Label("Tap a player to teleport next to them. Tap Teleport to spawn again to cycle through the spawns if there are several.")
+
+local listToken = 0
+local function refreshPlayerList()
+	listToken += 1
+	local id = listToken
+	-- short delay so a burst of joins / leaves rebuilds the list once
+	task.delay(0.2, function()
+		if id ~= listToken or not gui.Parent then
+			return
+		end
+		playerListBox.Clear()
+		local others = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= player then
+				table.insert(others, p)
+			end
+		end
+		table.sort(others, function(a, b)
+			return a.DisplayName:lower() < b.DisplayName:lower()
+		end)
+		for _, p in ipairs(others) do
+			local text = escapeRich(p.DisplayName)
+			if p.DisplayName ~= p.Name then
+				text = text .. ' <font color="#9090a6">@' .. escapeRich(p.Name) .. "</font>"
+			end
+			playerListBox.Add(text, function()
+				Teleport.ToPlayer(p)
+			end)
+		end
+	end)
+end
+connect(Players.PlayerAdded, refreshPlayerList)
+connect(Players.PlayerRemoving, refreshPlayerList)
+refreshPlayerList()
+
 local worldTab = addTab("World")
 worldTab:Section("Topbar")
 worldTab:Choice("Topbar style", { "2018", "2021", "Current" }, "Current", function(name)
@@ -3982,15 +4109,6 @@ Topbar.OnStatus = function(text)
 	end
 end
 worldTab:Label("2018 and 2021 swap Roblox's topbar for a working copy that reaches the screen edges. Current is Roblox's real topbar: it is hidden while a copy is shown and comes back when you pick Current or close Toolx. The two lines above say whether the real topbar was hidden and what the last button you pressed did.")
-
-worldTab:Section("Explorer")
-
-local DEX_URL = "https://raw.githubusercontent.com/infyiff/backup/main/dex.lua"
-
-worldTab:Button("Execute Dex", function(lbl)
-	runRemote(lbl, "Dex", DEX_URL)
-end)
-worldTab:Label("Loads Dex explorer from GitHub. Once it's running, the button won't start a second copy.")
 
 local utilityTab = addTab("Utility")
 utilityTab:Section("Server")
@@ -4476,7 +4594,7 @@ do
 end
 
 ---------------------------------------------------------------------
--- Open animation
+-- Startup: restore saved options, then open the window
 ---------------------------------------------------------------------
 -- Restore saved options (only when "Keep options" was on last time)
 if keepEnabled then

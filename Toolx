@@ -5292,9 +5292,129 @@ utilityTab:Label("Raises Roblox's frame rate limit. Turning it off puts the limi
 local scannerTab = addTab("Scanner")
 
 scannerTab:Section("Backdoor Scanner")
-scannerTab:Label("Scans ReplicatedStorage and Workspace for responsive remotes. Tap any discovered remote to fire it.")
+scannerTab:Label("Scans ReplicatedStorage and Workspace for responsive remotes. Tap any discovered remote to fire it using your custom arguments.")
 
 local scanResultsBox = scannerTab:LogBox(140, 40, "No scan performed yet")
+
+scannerTab:Section("Payload Arguments")
+scannerTab:Label("Add custom arguments to send when firing discovered remotes.")
+
+local argRowsContainer = scannerTab:Container()
+new("UIListLayout", {
+	Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+}, argRowsContainer)
+
+local customArgsList = {}
+
+local function renderArgRows()
+	for _, c in ipairs(argRowsContainer:GetChildren()) do
+		if not c:IsA("UIListLayout") then
+			c:Destroy()
+		end
+	end
+	
+	for i, argData in ipairs(customArgsList) do
+		local r = new("Frame", {
+			Size = UDim2.new(1, 0, 0, 36),
+			BackgroundColor3 = theme.surface,
+			BackgroundTransparency = 0.35,
+			BorderSizePixel = 0,
+			LayoutOrder = i,
+		}, argRowsContainer)
+		corner(r, 8)
+		stroke(r, 0.94)
+		
+		-- Type choice button/label
+		local typeBtn = new("TextButton", {
+			Text = argData.type,
+			Font = Enum.Font.GothamBold,
+			TextSize = 11,
+			TextColor3 = theme.accent,
+			AutoButtonColor = false,
+			BackgroundColor3 = theme.off,
+			BorderSizePixel = 0,
+			Position = UDim2.new(0, 8, 0.5, -14),
+			Size = UDim2.fromOffset(72, 28),
+		}, r)
+		corner(typeBtn, 6)
+		
+		typeBtn.Activated:Connect(function()
+			if argData.type == "String" then
+				argData.type = "Number"
+			elseif argData.type == "Number" then
+				argData.type = "Boolean"
+			else
+				argData.type = "String"
+			end
+			typeBtn.Text = argData.type
+		end)
+		
+		-- Value input box
+		local valBox = new("TextBox", {
+			Text = argData.val,
+			PlaceholderText = "Value...",
+			PlaceholderColor3 = theme.dim,
+			ClearTextOnFocus = false,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundColor3 = theme.surface,
+			BackgroundTransparency = 0.5,
+			BorderSizePixel = 0,
+			Position = UDim2.new(0, 88, 0.5, -14),
+			Size = UDim2.new(1, -132, 0, 28),
+		}, r)
+		corner(valBox, 6)
+		new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, valBox)
+		valBox:GetPropertyChangedSignal("Text"):Connect(function()
+			argData.val = valBox.Text
+		end)
+		
+		-- Delete button
+		local delBtn = new("TextButton", {
+			Text = "×",
+			Font = Enum.Font.GothamBold,
+			TextSize = 14,
+			TextColor3 = theme.red,
+			AutoButtonColor = false,
+			BackgroundColor3 = theme.surface,
+			BackgroundTransparency = 0.5,
+			BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -8, 0.5, 0),
+			Size = UDim2.fromOffset(28, 28),
+		}, r)
+		corner(delBtn, 6)
+		delBtn.Activated:Connect(function()
+			table.remove(customArgsList, i)
+			renderArgRows()
+		end)
+	end
+end
+
+scannerTab:Button("+ Add Argument", function()
+	table.insert(customArgsList, { type = "String", val = "Hello" })
+	renderArgRows()
+end)
+
+local function getBuiltArguments()
+	local args = {}
+	for _, item in ipairs(customArgsList) do
+		if item.type == "String" then
+			table.insert(args, item.val)
+		elseif item.type == "Number" then
+			table.insert(args, tonumber(item.val) or 0)
+		elseif item.type == "Boolean" then
+			table.insert(args, item.val:lower() == "true")
+		end
+	}
+	if #args == 0 then
+		table.insert(args, "Toolx Manual Fire")
+	end
+	return args
+end
 
 scannerTab:Button("Run Scan", function(lbl)
 	lbl.Text = "Scanning..."
@@ -5303,7 +5423,7 @@ scannerTab:Button("Run Scan", function(lbl)
 	task.spawn(function()
 		local ReplicatedStorage = game:GetService("ReplicatedStorage")
 		local Workspace = game:GetService("Workspace")
-		local payloads = {
+		local defaultPayloads = {
 			"print('Toolx Backdoor Scan Active')",
 			"game:GetService('HttpService')",
 		}
@@ -5314,7 +5434,7 @@ scannerTab:Button("Run Scan", function(lbl)
 		for _, container in ipairs(containers) do
 			for _, descendant in ipairs(container:GetDescendants()) do
 				if descendant:IsA("RemoteEvent") or descendant:IsA("RemoteFunction") then
-					for _, payload in ipairs(payloads) do
+					for _, payload in ipairs(defaultPayloads) do
 						local ok = pcall(function()
 							if descendant:IsA("RemoteEvent") then
 								descendant:FireServer(payload)
@@ -5328,18 +5448,19 @@ scannerTab:Button("Run Scan", function(lbl)
 							scanResultsBox.Add(
 								string.format('<font color="#4cc978">%s</font> (%s)', escapeRich(remoteObj.Name), escapeRich(remoteObj.ClassName)),
 								function()
+									local argsToFire = getBuiltArguments()
 									local fireOk = pcall(function()
 										if remoteObj:IsA("RemoteEvent") then
-											remoteObj:FireServer("Toolx Manual Fire")
+											remoteObj:FireServer(unpack(argsToFire))
 										elseif remoteObj:IsA("RemoteFunction") then
-											remoteObj:InvokeServer("Toolx Manual Fire")
+											remoteObj:InvokeServer(unpack(argsToFire))
 										end
 									end)
 									if fireOk then
-										notify("Successfully fired: " + remoteObj.Name, "success")
+										notify("Successfully fired: " .. remoteObj.Name, "success")
 										return "Fired!"
 									else
-										notify("Failed to fire: " + remoteObj.Name, "error")
+										notify("Failed to fire: " .. remoteObj.Name, "error")
 										return "Error"
 									end
 								end
@@ -5354,59 +5475,6 @@ scannerTab:Button("Run Scan", function(lbl)
 		lbl.Text = "Run Scan"
 		notify(string.format("Scan complete: found %d responsive remotes", count), "success")
 	end)
-end)
-
-scannerTab:Section("Remote Spy")
-scannerTab:Label("Monitors and logs all client-to-server FireServer and InvokeServer calls in real time.")
-
-local remoteSpyBox = scannerTab:LogBox(140, 50, "Remote spy is off")
-local originalNamecall
-local spyEnabled = false
-
-scannerTab:Toggle("Enable Remote Spy", false, function(state)
-	spyEnabled = state
-	if state then
-		if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
-			notify("Remote spy requires hookmetamethod", "error")
-			return
-		end
-		if not originalNamecall then
-			local ok = pcall(function()
-				originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-					if spyEnabled and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
-						local method = getnamecallmethod()
-						if method == "FireServer" or method == "InvokeServer" then
-							local args = {...}
-							local argStrs = {}
-							for _, arg in ipairs(args) do
-								table.insert(argStrs, tostring(arg))
-							end
-							local timeStr = os.date("%H:%M:%S")
-							remoteSpyBox.Add(string.format(
-								'<font color="#9090a6">[%s]</font> <font color="#6c80ff">%s</font> (%s) -> %s',
-								timeStr,
-								escapeRich(self.Name),
-								method,
-								escapeRich(table.concat(argStrs, ", "))
-							))
-						end
-					end
-					return originalNamecall(self, ...)
-				end)
-			end)
-			if not ok then
-				notify("Failed to hook metamethod for spy", "error")
-			end
-		end
-		notify("Remote spy enabled", "success")
-	else
-		notify("Remote spy disabled", "info")
-	end
-end, "scanner.remotespy")
-
-scannerTab:Button("Clear Spy Logs", function(lbl)
-	remoteSpyBox.Clear()
-	flashLabel(lbl, "Cleared")
 end)
 
 local settingsTab = addTab("Settings")
@@ -5833,6 +5901,77 @@ do
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = true
 			dragStart = input.Position
+			startPos = main.Position
+			local c
+			c = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					c:Disconnect()
+				end
+			end)
+		end
+	end)
+
+	connect(titleBar.InputChanged, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+
+	connect(UserInputService.InputChanged, function(input)
+		if dragging and input == dragInput then
+			local d = input.Position - dragStart
+			main.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y
+			)
+		end
+	end)
+end
+
+---------------------------------------------------------------------
+-- Startup: restore saved options, then open the window
+---------------------------------------------------------------------
+-- Restore saved options (only when "Keep options" was on last time)
+if keepEnabled then
+	loadingOptions = true
+	for key, comp in pairs(registry) do
+		local value = savedData.options[key]
+		local available = not (comp.IsEnabled and not comp.IsEnabled())
+		if value ~= nil and available and typeof(value) == typeof(comp.Get()) then
+			pcall(comp.Set, value)
+		end
+	end
+	loadingOptions = false
+
+	-- make sure the saved topbar really gets applied (size first, then style)
+	local savedStyle = savedData.options["world.topbar"]
+	if savedStyle == "2018" or savedStyle == "2021" then
+		local savedSize = savedData.options["world.topbarSize"]
+		task.spawn(function()
+			task.wait(0.5)
+			if closing then
+				return
+			end
+			if typeof(savedSize) == "number" then
+				pcall(Topbar.SetScale, savedSize)
+			end
+			pcall(Topbar.Set, savedStyle)
+		end)
+	end
+end
+
+selectTab(mainTab)
+tween(main, 0.4, { GroupTransparency = 0 })
+tween(mainScale, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
+setBlur(true)
+
+pcall(function()
+	getgenv().Toolx = Toolx
+end)
+
+return Toolx
+dragStart = input.Position
 			startPos = main.Position
 			local c
 			c = input.Changed:Connect(function()

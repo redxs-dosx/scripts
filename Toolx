@@ -1894,21 +1894,40 @@ do
 	-- Fling helpers
 	---------------------------------------------------------------------
 
-	-- Returns true if the target player's root has significant velocity,
-	-- which is a good proxy for "they are currently being flung / mid-air fast".
-	local FLING_SPEED_THRESHOLD = 80  -- studs/s; tweak if needed
+	-- How long we stay glued to the target blasting velocity (seconds).
+	-- 3 s is more than enough to send anyone into orbit reliably.
+	local FLING_DURATION    = 3.0
+	-- How high (studs) above their spawn Y the target must be before we
+	-- consider them "definitely flung" and stop early.
+	local FLING_HEIGHT      = 40
+	-- Velocity applied to the target's root every Heartbeat tick.
+	-- We keep reapplying it so the physics engine can't cancel it out.
+	local FLING_VEL_UP      = 500   -- Y component  (studs/s)
+	local FLING_VEL_HORIZ   = 180   -- max horizontal scatter (studs/s)
 
-	local function isFlung(target)
-		local root = getRoot(target.Character)
-		if not root then
-			return false
+	-- Returns the Y position the target was at when they last touched the
+	-- ground, used as the reference for height-based "flung" detection.
+	-- Falls back to 0 if we can't read it.
+	local function groundY(target)
+		local char = target.Character
+		if not char then
+			return 0
 		end
-		return root.AssemblyLinearVelocity.Magnitude >= FLING_SPEED_THRESHOLD
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		-- FloorMaterial is not None while standing on something
+		if hum and hum.FloorMaterial ~= Enum.Material.Air then
+			local root = getRoot(char)
+			return root and root.Position.Y or 0
+		end
+		-- If already in the air, best we can do is use current Y
+		local root = getRoot(char)
+		return root and root.Position.Y or 0
 	end
 
-	-- Sits on top of the target for a moment to fling them, then polls until
-	-- they are clearly moving fast (flung) or a timeout expires.
-	-- Returns true if the fling appeared to succeed.
+	-- Core fling routine.  Runs in a tight Heartbeat loop for up to
+	-- FLING_DURATION seconds, keeping us welded on top of the target
+	-- and hammering their root with velocity every single physics step.
+	-- Returns true once the target is clearly airborne and high up.
 	local function doFling(target)
 		local myChar = player.Character
 		local myRoot = getRoot(myChar)
@@ -1920,38 +1939,75 @@ do
 			return false
 		end
 
-		-- Teleport on top of the target
-		local cf = targetRoot.CFrame * CFrame.new(0, 0.5, 0)
-		pcall(function()
-			myChar:PivotTo(cf)
+		-- Snapshot ground level before we start moving them
+		local baseY = groundY(target)
+
+		-- Pick a random horizontal scatter direction once so it stays
+		-- consistent rather than jittering every frame
+		local hx = (math.random() * 2 - 1) * FLING_VEL_HORIZ
+		local hz = (math.random() * 2 - 1) * FLING_VEL_HORIZ
+
+		local startTime = os.clock()
+		local flung     = false
+		local conn
+
+		conn = RunService.Heartbeat:Connect(function()
+			-- Stop if target left or time expired
+			if not target.Parent or not target.Character then
+				conn:Disconnect()
+				return
+			end
+			local tr = getRoot(target.Character)
+			local mr = getRoot(player.Character)
+			if not tr or not mr then
+				conn:Disconnect()
+				return
+			end
+
+			-- Weld ourselves on top of the target every frame so we keep
+			-- pushing against them rather than drifting away
+			pcall(function()
+				player.Character:PivotTo(tr.CFrame * CFrame.new(0, 1, 0))
+			end)
+
+			-- Blast velocity onto both roots every frame.
+			-- Applying it to our own root as well creates a sustained
+			-- collision force that the server can't easily reject.
+			pcall(function()
+				tr.AssemblyLinearVelocity  = Vector3.new(hx, FLING_VEL_UP, hz)
+				mr.AssemblyLinearVelocity  = Vector3.new(hx, FLING_VEL_UP, hz)
+			end)
+
+			-- Height-based "definitely flung" check: much more reliable than
+			-- a velocity read because velocity can momentarily dip to zero
+			-- even while the character is sailing through the air.
+			local heightGained = tr.Position.Y - baseY
+			local elapsed      = os.clock() - startTime
+
+			if heightGained >= FLING_HEIGHT then
+				flung = true
+				conn:Disconnect()
+				return
+			end
+
+			if elapsed >= FLING_DURATION then
+				-- Time's up — call it a success if they're at least off the ground
+				flung = heightGained > 5
+				conn:Disconnect()
+			end
 		end)
 
-		-- Apply a large upward impulse from our root onto theirs via seat trick:
-		-- We use AssemblyLinearVelocity directly since we're in the same client.
-		-- On most games this is enough to send the target flying.
-		local ok = pcall(function()
-			myRoot.AssemblyLinearVelocity = Vector3.new(0, 350, 0)
-			targetRoot.AssemblyLinearVelocity = Vector3.new(
-				math.random(-120, 120),
-				500,
-				math.random(-120, 120)
-			)
-		end)
-		if not ok then
-			return false
+		-- Block until the Heartbeat loop finishes
+		local deadline = os.clock() + FLING_DURATION + 0.5
+		repeat
+			task.wait(0.05)
+		until not conn.Connected or os.clock() >= deadline
+
+		if conn.Connected then
+			conn:Disconnect()
 		end
 
-		-- Wait up to 2.5 s for the fling to register
-		local deadline = os.clock() + 2.5
-		repeat
-			task.wait(0.1)
-			if isFlung(target) then
-				return true
-			end
-		until os.clock() >= deadline
-
-		-- Fall back: check one last time
-		return isFlung(target)
+		return flung
 	end
 
 	-- Fling a single named player; return to origin afterward.
@@ -1971,25 +2027,19 @@ do
 			return
 		end
 
-		-- Remember where we are so we can return after
 		local origin = myRoot.CFrame
-
 		notify("Flinging " .. target.DisplayName .. "...", "info")
+
 		local success = doFling(target)
 
-		-- Wait until the target is visibly launched or a safety timeout elapses
-		if success then
-			-- Give it a moment so the velocity propagates before we teleport back
-			task.wait(0.3)
-		end
-
-		-- Return to origin
+		-- Small grace period so the velocity keeps carrying them before we jump away
+		task.wait(0.25)
 		moveTo(origin)
 
 		if success then
 			notify("Flung " .. target.DisplayName .. "!", "success")
 		else
-			notify("Fling may not have worked on " .. target.DisplayName, "warn")
+			notify(target.DisplayName .. " resisted (try again)", "warn")
 		end
 	end
 
@@ -2017,6 +2067,7 @@ do
 
 		local original = lbl and lbl.Text or nil
 		local done, failed = 0, 0
+
 		for i, target in ipairs(others) do
 			if lbl and lbl.Parent then
 				lbl.Text = string.format("Flinging %d/%d...", i, #others)
@@ -2029,19 +2080,18 @@ do
 				failed += 1
 			else
 				local success = doFling(target)
+				task.wait(0.25)    -- grace period before we leave
+				moveTo(origin)
+				task.wait(0.15)    -- settle before next target
+
 				if success then
 					done += 1
-					task.wait(0.3)
 				else
 					failed += 1
 				end
-				-- Return to origin before the next target
-				moveTo(origin)
-				task.wait(0.15)
 			end
 		end
 
-		-- Final return to origin
 		moveTo(origin)
 
 		if lbl and lbl.Parent then
@@ -2051,7 +2101,7 @@ do
 		if failed == 0 then
 			notify(string.format("Flung all %d players!", done), "success")
 		else
-			notify(string.format("Flung %d / %d players (%d failed)", done, #others, failed), done > 0 and "warn" or "error")
+			notify(string.format("Flung %d / %d players (%d may have resisted)", done, #others, failed), done > 0 and "warn" or "error")
 		end
 	end
 end

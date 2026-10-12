@@ -5263,6 +5263,60 @@ if not Perf.Supported() then
 end
 utilityTab:Label("Raises Roblox's frame rate limit. Turning it off puts the limit back to what it was. The live FPS is in Settings > Info.")
 
+---------------------------------------------------------------------
+-- Scanner tab
+---------------------------------------------------------------------
+local scannerTab = addTab("Scanner")
+scannerTab:Section("Backdoor Scanner")
+scannerTab:Label("Scans ReplicatedStorage and Workspace for responsive remotes.")
+
+local scanResultsBox = scannerTab:LogBox(180, 50, "No scan performed yet")
+
+scannerTab:Button("Run Scan", function(lbl)
+	lbl.Text = "Scanning..."
+	scanResultsBox.Clear()
+	
+	task.spawn(function()
+		local ReplicatedStorage = game:GetService("ReplicatedStorage")
+		local Workspace = game:GetService("Workspace")
+		local payloads = {
+			"print('Toolx Backdoor Scan Active')",
+			"game:GetService('HttpService')",
+		}
+		
+		local count = 0
+		local containers = { ReplicatedStorage, Workspace }
+		
+		for _, container in ipairs(containers) do
+			for _, descendant in ipairs(container:GetDescendants()) do
+				if descendant:IsA("RemoteEvent") or descendant:IsA("RemoteFunction") then
+					for _, payload in ipairs(payloads) do
+						local ok = pcall(function()
+							if descendant:IsA("RemoteEvent") then
+								descendant:FireServer(payload)
+							elseif descendant:IsA("RemoteFunction") then
+								descendant:InvokeServer(payload)
+							end
+						end)
+						if ok then
+							count += 1
+							scanResultsBox.Add(string.format(
+								'<font color="#4cc978">%s</font> (%s)',
+								escapeRich(descendant.Name),
+								escapeRich(descendant.ClassName)
+							))
+							break
+						end
+					end
+				end
+			end
+		end
+		
+		lbl.Text = "Run Scan"
+		notify(string.format("Scan complete: found %d responsive remotes", count), "success")
+	end)
+end)
+
 local settingsTab = addTab("Settings")
 settingsTab:Section("Interface")
 settingsTab:Toggle("Background blur", true, function(state)
@@ -5755,246 +5809,5 @@ setBlur(true)
 pcall(function()
 	getgenv().Toolx = Toolx
 end)
-
----------------------------------------------------------------------
--- Backdoor scanner  (new tab via the exposed API)
----------------------------------------------------------------------
-local backdoorTab = Toolx.AddTab("Backdoor")
-
-backdoorTab:Section("Remote scanner")
-backdoorTab:Label("Enumerates every RemoteEvent, UnreliableRemoteEvent and RemoteFunction, fires code-shaped payloads at the server, and flags any remote that actually ran the payload. The payload runs on the server and drops a tagged marker in workspace, so execution is visible from the client. Blind firing only catches remotes that loadstring / require their arguments; a remote that only runs code on the game's own call pattern stays quiet - use the spy below to learn that pattern.")
-
-local TAG = "__BDSCAN"
-local scanRunning = false
-local reportLines = {}
-
-local resultBox = backdoorTab:LogBox(220, 400, "No scan yet - tap Scan remotes")
-
-local function collectRemotes()
-	local out = {}
-	for _, d in ipairs(game:GetDescendants()) do
-		if d:IsA("RemoteEvent") or d:IsA("UnreliableRemoteEvent") or d:IsA("RemoteFunction") then
-			table.insert(out, d)
-		end
-	end
-	return out
-end
-
-local function clearMarkers()
-	for _, v in ipairs(workspace:GetChildren()) do
-		if v:IsA("StringValue") and v.Name:sub(1, #TAG) == TAG then
-			v:Destroy()
-		end
-	end
-end
-
--- runs on the SERVER: find-or-create a tagged marker that replicates back to us
-local function payloadFor(token)
-	return string.format([[
-local name = "%s_%s"
-local v = workspace:FindFirstChild(name)
-if not v then
-	v = Instance.new("StringValue")
-	v.Name = name
-	v.Parent = workspace
-end
-v.Value = "%s"
-]], TAG, token, token)
-end
-
--- argument shapes the common backdoor handlers expect
-local function shapesFor(code)
-	return {
-		{ code },               -- loadstring(args[1])
-		{ "loadstring", code }, -- if a == "loadstring" then loadstring(b)
-		{ "exec", code },
-		{ "run", code },
-		{ code, code },
-		{ "require", 0 },       -- require(args[2])
-		{ 0 },
-		{},                     -- empty fire (HttpGet loaders)
-	}
-end
-
-local function report(rich, plain)
-	resultBox.Add(rich)
-	reportLines[#reportLines + 1] = plain or rich:gsub("<.->", "")
-end
-
-local function scan()
-	if scanRunning then
-		return
-	end
-	scanRunning = true
-	clearMarkers()
-	resultBox.Clear()
-	table.clear(reportLines)
-	resultBox.Add('<font color="#9090a6">Scanning...</font>')
-
-	task.spawn(function()
-		local remotes = collectRemotes()
-		local run = tostring(math.random(100000, 999999))
-		local tokens = {}
-
-		resultBox.Clear()
-		table.clear(reportLines)
-		report(string.format('<font color="#9090a6">%d remotes found. Firing payloads...</font>', #remotes))
-
-		for i, remote in ipairs(remotes) do
-			local token = ("%s_%d"):format(run, i)
-			tokens[token] = remote
-			for _, args in ipairs(shapesFor(payloadFor(token))) do
-				pcall(function()
-					if remote:IsA("RemoteFunction") then
-						remote:InvokeServer(table.unpack(args))
-					else
-						remote:FireServer(table.unpack(args))
-					end
-				end)
-				task.wait(0.1)
-			end
-		end
-
-		task.wait(1)
-
-		local hits = {}
-		for _, v in ipairs(workspace:GetChildren()) do
-			if v:IsA("StringValue") and v.Name:sub(1, #TAG) == TAG then
-				hits[v.Value] = true
-			end
-		end
-		clearMarkers()
-
-		resultBox.Clear()
-		table.clear(reportLines)
-
-		local flagged = 0
-		for token, remote in pairs(tokens) do
-			if hits[token] then
-				flagged += 1
-				local path = remote:GetFullName()
-				report(
-					string.format('<font color="#4cc978">EXEC</font>  %s', escapeRich(path)),
-					"EXEC  " .. path
-				)
-			end
-		end
-
-		if flagged == 0 then
-			report(string.format('<font color="#9090a6">Scanned %d remotes, none executed the payload shapes. They may validate arguments strictly - use the spy.</font>', #remotes))
-		else
-			report(string.format('<font color="#9090a6">Scanned %d remotes, %d executed code.</font>', #remotes, flagged))
-			Toolx.Notify(string.format("%d executable remote%s", flagged, flagged == 1 and "" or "s"), "success")
-		end
-
-		scanRunning = false
-	end)
-end
-
-backdoorTab:Button("Scan remotes", scan)
-backdoorTab:Button("Copy results", function(lbl)
-	if #reportLines == 0 then
-		flashLabel(lbl, "Nothing to copy")
-	elseif copyToClipboard(table.concat(reportLines, "\n")) then
-		flashLabel(lbl, "Copied!")
-	else
-		flashLabel(lbl, "No clipboard access")
-	end
-end)
-
----------------------------------------------------------------------
--- Remote spy: learn the argument pattern the game itself uses
----------------------------------------------------------------------
-backdoorTab:Section("Spy")
-backdoorTab:Label("Hooks every remote's FireServer so you can see the exact arguments the game passes when it fires one. Fire something in-game (open a menu, buy an item) and the call shows up below. Your own scans appear too.")
-
-local spyBox = backdoorTab:LogBox(150, 100, "Spy is off")
-local spyOn = false
-local spyRestore = {}
-
-local function fmtArg(v)
-	local t = typeof(v)
-	if t == "string" then
-		return '"' .. v:sub(1, 50) .. (#v > 50 and "..." or "") .. '"'
-	elseif t == "Instance" then
-		return v:GetFullName()
-	elseif t == "table" then
-		local parts = {}
-		for _, x in ipairs(v) do
-			parts[#parts + 1] = tostring(x)
-		end
-		return "{" .. table.concat(parts, ", ") .. "}"
-	end
-	return tostring(v)
-end
-
-local function startSpy()
-	if spyOn or typeof(hookfunction) ~= "function" then
-		return typeof(hookfunction) == "function"
-	end
-	spyOn = true
-	for _, remote in ipairs(collectRemotes()) do
-		pcall(function()
-			local f = remote.FireServer
-			local old
-			local function hook(self, ...)
-				if spyOn then
-					local args = table.pack(...)
-					local parts = {}
-					for i = 1, args.n do
-						parts[#parts + 1] = fmtArg(args[i])
-					end
-					spyBox.Add(string.format(
-						'<font color="#9090a6">%s</font>(%s)',
-						escapeRich(remote.Name),
-						escapeRich(table.concat(parts, ", "))
-					))
-				end
-				return old(self, ...)
-			end
-			if typeof(newcclosure) == "function" then
-				hook = newcclosure(hook)
-			end
-			old = hookfunction(f, hook)
-			table.insert(spyRestore, { f = f, old = old })
-		end)
-	end
-	return true
-end
-
-local function stopSpy()
-	spyOn = false
-	for _, entry in ipairs(spyRestore) do
-		pcall(function()
-			hookfunction(entry.f, entry.old)
-		end)
-	end
-	table.clear(spyRestore)
-end
-
-local spyToggle
-spyToggle = backdoorTab:Toggle("Remote spy", false, function(state)
-	if state then
-		if not startSpy() then
-			spyToggle.Set(false, true)
-			Toolx.Notify("Spy needs hookfunction", "warn")
-			return
-		end
-		spyBox.Clear()
-	else
-		stopSpy()
-	end
-end)
-if typeof(hookfunction) ~= "function" then
-	spyToggle.SetEnabled(false, "No hookfunction")
-end
-
-backdoorTab:Button("Clear spy", function(lbl)
-	spyBox.Clear()
-	flashLabel(lbl, "Cleared")
-end)
-
-backdoorTab:Section("Notes")
-backdoorTab:Label("EXEC means the server ran our string, so that remote reaches a loadstring / require / dofile. Empty-fire and require(0) hits often mean an HttpGet loader: the remote ignores what you send and pulls a URL itself. If a remote stays quiet, turn on the spy, trigger the game action that fires it, and fire the same shape back by hand.")
 
 return Toolx

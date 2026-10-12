@@ -1,10 +1,10 @@
 --[[
-	Toolx  |  GUI shell (no tool functionality yet)
+	Toolx  |  Roblox utility toolkit
 	Works as a LocalScript or from an executor (Delta etc.)
 
 	Close:     the X button
 	Minimize:  the - button (collapses into a pill at the top, tap the pill to restore)
-	PC:        RightShift toggles minimize / restore
+	PC:        the toggle key minimizes / restores (RightShift by default, rebind it in Settings)
 
 	Add features later through the exposed API:
 		local tab = Toolx.AddTab("Name")
@@ -12,7 +12,11 @@
 		tab:Label("text")
 		tab:Button("Text", function() end)
 		tab:Toggle("Text", false, function(state) end)
+		tab:Keybind("Text", "F4", function(keyName) end)
+		Toolx.Notify("text", "info" | "success" | "warn" | "error")
 ]]
+
+local VERSION = "0.2"
 
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
@@ -95,6 +99,10 @@ local function connect(signal, fn)
 	table.insert(connections, c)
 	return c
 end
+
+-- The key that minimizes / restores the window (rebindable in Settings). nil = no key.
+local toggleKey = Enum.KeyCode.RightShift
+local capturingKey = false -- true while a Keybind row is waiting for a key press
 
 ---------------------------------------------------------------------
 -- Saved options ("Keep options" setting)
@@ -245,6 +253,124 @@ local function setBlur(on)
 end
 
 ---------------------------------------------------------------------
+-- Notifications (small toasts, top right). Work while the window is minimized.
+---------------------------------------------------------------------
+local notifyEnabled = true
+local TOAST_W = 236
+local MAX_TOASTS = 4
+local toastColors = {
+	info = theme.accent,
+	success = Color3.fromRGB(76, 201, 120),
+	warn = theme.amber,
+	error = theme.red,
+}
+
+local toastHost = new("Frame", {
+	Name = "Toasts",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -14, 0, 56),
+	Size = UDim2.fromOffset(TOAST_W, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	ZIndex = 10,
+}, gui)
+new("UIListLayout", {
+	Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	HorizontalAlignment = Enum.HorizontalAlignment.Right,
+}, toastHost)
+
+local toastList = {}
+local toastSeq = 0
+
+local function dismissToast(t)
+	if t.gone then
+		return
+	end
+	t.gone = true
+	for i, v in ipairs(toastList) do
+		if v == t then
+			table.remove(toastList, i)
+			break
+		end
+	end
+	tween(t.card, 0.25, { GroupTransparency = 1 })
+	task.delay(0.3, function()
+		t.card:Destroy()
+	end)
+end
+
+-- kind: "info" (default) | "success" | "warn" | "error"
+local function notify(text, kind, duration)
+	-- stay quiet while saved options are being re-applied at startup
+	if not notifyEnabled or loadingOptions or not gui.Parent then
+		return
+	end
+	toastSeq += 1
+	local card = new("CanvasGroup", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = theme.bg,
+		BackgroundTransparency = 0.08,
+		BorderSizePixel = 0,
+		GroupTransparency = 1,
+		LayoutOrder = toastSeq,
+	}, toastHost)
+	corner(card, 10)
+	stroke(card, 0.85)
+	new("UIPadding", {
+		PaddingTop = UDim.new(0, 8),
+		PaddingBottom = UDim.new(0, 8),
+		PaddingLeft = UDim.new(0, 12),
+		PaddingRight = UDim.new(0, 10),
+	}, card)
+	-- accent strip on the left edge (cancels the padding so it reaches the card's edges)
+	new("Frame", {
+		Position = UDim2.new(0, -12, 0, -8),
+		Size = UDim2.new(0, 3, 1, 16),
+		BackgroundColor3 = toastColors[kind or "info"] or toastColors.info,
+		BorderSizePixel = 0,
+	}, card)
+	new("TextLabel", {
+		Text = tostring(text),
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		TextColor3 = theme.text,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		BackgroundTransparency = 1,
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Size = UDim2.new(1, 0, 0, 0),
+	}, card)
+
+	local t = { card = card, gone = false }
+	table.insert(toastList, t)
+
+	-- tap a toast to dismiss it
+	local hit = new("TextButton", {
+		Text = "",
+		AutoButtonColor = false,
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(-12, -8),
+		Size = UDim2.new(1, 22, 1, 16),
+		ZIndex = 2,
+	}, card)
+	hit.Activated:Connect(function()
+		dismissToast(t)
+	end)
+
+	tween(card, 0.25, { GroupTransparency = 0 })
+	task.delay(duration or 2.8, function()
+		dismissToast(t)
+	end)
+
+	while #toastList > MAX_TOASTS do
+		dismissToast(toastList[1])
+	end
+end
+
+---------------------------------------------------------------------
 -- Main window
 ---------------------------------------------------------------------
 local function getWindowSize()
@@ -294,7 +420,7 @@ local dot = new("Frame", {
 corner(dot, 4)
 
 new("TextLabel", {
-	Text = 'Toolx  <font size="11" color="#9090a6">GUI preview</font>',
+	Text = 'Toolx  <font size="11" color="#9090a6">v' .. VERSION .. "</font>",
 	RichText = true,
 	Font = Enum.Font.GothamBold,
 	TextSize = 15,
@@ -372,7 +498,7 @@ local indicatorBar = new("Frame", {
 corner(indicatorBar, 2)
 
 new("TextLabel", {
-	Text = "v0.1",
+	Text = "v" .. VERSION,
 	Font = Enum.Font.Gotham,
 	TextSize = 11,
 	TextColor3 = theme.dim,
@@ -741,6 +867,124 @@ local function addTab(name)
 			Set = choose,
 			Get = function()
 				return selected
+			end,
+		}
+		if key then
+			registry[key] = comp
+		end
+		return comp
+	end
+
+	-- Press-a-key picker: tap the row, then press the key to bind it (Esc cancels, Backspace clears).
+	-- Get / Set use the KeyCode name ("RightShift"), or "None". callback(name) fires when it changes.
+	function api:Keybind(text, default, callback, key)
+		local current = default or "None"
+		local listening = false
+		local listenConn
+
+		local r = row(38)
+		new("TextLabel", {
+			Text = text,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 13,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 0),
+			Size = UDim2.new(1, -130, 1, 0),
+		}, r)
+		local chip = new("Frame", {
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			Size = UDim2.fromOffset(106, 24),
+			BackgroundColor3 = theme.off,
+			BorderSizePixel = 0,
+		}, r)
+		corner(chip, 6)
+		local keyLabel = new("TextLabel", {
+			Text = current,
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextColor3 = theme.accent,
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+		}, chip)
+
+		local function show()
+			keyLabel.Text = listening and "Press a key..." or current
+			keyLabel.TextColor3 = listening and theme.amber or theme.accent
+		end
+
+		local function set(name, silent)
+			if typeof(name) ~= "string" then
+				return
+			end
+			local valid = name == "None" or (pcall(function()
+				return Enum.KeyCode[name]
+			end))
+			if not valid then
+				return
+			end
+			local changed = name ~= current
+			current = name
+			show()
+			if changed and not silent then
+				if callback then
+					task.spawn(callback, name)
+				end
+				if key then
+					optionChanged()
+				end
+			end
+		end
+
+		local function stopListening()
+			listening = false
+			if listenConn then
+				listenConn:Disconnect()
+				listenConn = nil
+			end
+			-- clear on the next resumption point so the same key press can't also toggle the window
+			task.defer(function()
+				capturingKey = false
+			end)
+			show()
+		end
+
+		connect(r.MouseEnter, function()
+			tween(r, 0.15, { BackgroundTransparency = 0.2 })
+		end)
+		connect(r.MouseLeave, function()
+			tween(r, 0.15, { BackgroundTransparency = 0.35 })
+		end)
+		connect(r.Activated, function()
+			if listening then
+				stopListening()
+				return
+			end
+			listening = true
+			capturingKey = true
+			show()
+			listenConn = connect(UserInputService.InputBegan, function(input)
+				if input.UserInputType ~= Enum.UserInputType.Keyboard then
+					return
+				end
+				if input.KeyCode == Enum.KeyCode.Escape then
+					stopListening()
+				elseif input.KeyCode == Enum.KeyCode.Backspace then
+					stopListening()
+					set("None")
+				elseif input.KeyCode ~= Enum.KeyCode.Unknown then
+					stopListening()
+					set(input.KeyCode.Name)
+				end
+			end)
+		end)
+
+		local comp = {
+			Set = set,
+			Get = function()
+				return current
 			end,
 		}
 		if key then
@@ -3299,6 +3543,250 @@ local function runRemote(lbl, name, url)
 end
 
 ---------------------------------------------------------------------
+-- Server (rejoin / server hop)
+---------------------------------------------------------------------
+local Server = {}
+do
+	local TeleportService = game:GetService("TeleportService")
+	local busy = false
+
+	-- teleports can hang without ever failing, so never stay locked for long
+	local function lock(seconds)
+		busy = true
+		task.delay(seconds, function()
+			busy = false
+		end)
+	end
+
+	connect(TeleportService.TeleportInitFailed, function(plr, result, message)
+		if plr == player then
+			busy = false
+			notify("Teleport failed: " .. tostring(message ~= "" and message or result), "error", 4)
+		end
+	end)
+
+	function Server.Rejoin()
+		if busy then
+			notify("Already teleporting", "warn")
+			return
+		end
+		lock(20)
+		notify("Rejoining...")
+		local ok, err = pcall(function()
+			if #Players:GetPlayers() <= 1 or game.JobId == "" then
+				-- alone in the server (it would close when you leave), so just join a fresh one
+				TeleportService:Teleport(game.PlaceId, player)
+			else
+				TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, player)
+			end
+		end)
+		if not ok then
+			busy = false
+			warn("[Toolx] rejoin failed: " .. tostring(err))
+			notify("Rejoin failed", "error")
+		end
+	end
+
+	-- Public servers that aren't full and aren't the one you are in (first two pages, emptiest first)
+	local function findServers()
+		local list = {}
+		local cursor
+		for _ = 1, 2 do
+			local url = "https://games.roblox.com/v1/games/" .. game.PlaceId
+				.. "/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
+			if cursor then
+				url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
+			end
+			local body = fetchUrl(url)
+			if not body then
+				return list, "Couldn't reach Roblox's server list"
+			end
+			local ok, data = pcall(function()
+				return HttpService:JSONDecode(body)
+			end)
+			if not ok or typeof(data) ~= "table" or typeof(data.data) ~= "table" then
+				return list, "Couldn't read the server list (rate limited?)"
+			end
+			for _, s in ipairs(data.data) do
+				if
+					typeof(s) == "table"
+					and typeof(s.id) == "string"
+					and s.id ~= game.JobId
+					and typeof(s.playing) == "number"
+					and typeof(s.maxPlayers) == "number"
+					and s.playing < s.maxPlayers
+				then
+					table.insert(list, s)
+				end
+			end
+			cursor = data.nextPageCursor
+			if typeof(cursor) ~= "string" then
+				break
+			end
+		end
+		return list
+	end
+
+	function Server.Hop()
+		if busy then
+			notify("Already teleporting", "warn")
+			return
+		end
+		lock(30)
+		notify("Looking for another server...")
+		local list, problem = findServers()
+		if #list == 0 then
+			busy = false
+			notify(problem or "No other server found", problem and "error" or "warn", 3.5)
+			return
+		end
+		local pick = list[math.random(#list)]
+		notify(string.format("Hopping (%d/%d players)...", pick.playing, pick.maxPlayers), "success")
+		local ok, err = pcall(function()
+			TeleportService:TeleportToPlaceInstance(game.PlaceId, pick.id, player)
+		end)
+		if not ok then
+			busy = false
+			warn("[Toolx] server hop failed: " .. tostring(err))
+			notify("Server hop failed", "error")
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- Anti-AFK (answers Roblox's idle timeout so you aren't kicked after 20 minutes)
+---------------------------------------------------------------------
+local AntiAFK = {}
+do
+	local conn
+	local lastToast = 0
+	local VirtualUser, VIM
+	pcall(function()
+		VirtualUser = game:GetService("VirtualUser")
+	end)
+	pcall(function()
+		VIM = game:GetService("VirtualInputManager")
+	end)
+
+	local function poke()
+		if VirtualUser then
+			local ok = pcall(function()
+				VirtualUser:CaptureController()
+				VirtualUser:ClickButton2(Vector2.new())
+			end)
+			if ok then
+				return true
+			end
+		end
+		if VIM then
+			-- right click in the middle of the screen (harmless, unlike the corners where the menu button lives)
+			local cam = workspace.CurrentCamera
+			local mid = cam and cam.ViewportSize / 2 or Vector2.new(400, 300)
+			return (pcall(function()
+				VIM:SendMouseButtonEvent(mid.X, mid.Y, 1, true, game, 0)
+				task.wait(0.05)
+				VIM:SendMouseButtonEvent(mid.X, mid.Y, 1, false, game, 0)
+			end))
+		end
+		return false
+	end
+
+	function AntiAFK.Set(on)
+		if conn then
+			conn:Disconnect()
+			conn = nil
+		end
+		if not on then
+			return
+		end
+		conn = player.Idled:Connect(function()
+			local ok = poke()
+			local now = os.clock()
+			if now - lastToast > 30 then
+				lastToast = now
+				notify(ok and "Anti-AFK: stopped an idle kick" or "Anti-AFK: couldn't send input", ok and "info" or "error")
+			end
+		end)
+	end
+
+	function AntiAFK.Unload()
+		AntiAFK.Set(false)
+	end
+end
+
+---------------------------------------------------------------------
+-- Performance: FPS unlocker (setfpscap) + FPS counter
+---------------------------------------------------------------------
+local Perf = {}
+do
+	local CAPS = { ["60"] = 60, ["120"] = 120, ["240"] = 240, Max = 0 } -- 0 = uncapped
+	local enabled, cap, original = false, 240, nil
+
+	function Perf.Supported()
+		return typeof(setfpscap) == "function"
+	end
+
+	local function apply(value)
+		if Perf.Supported() then
+			pcall(setfpscap, value)
+		end
+	end
+
+	function Perf.Set(on)
+		if not Perf.Supported() then
+			return false
+		end
+		if on then
+			if original == nil then
+				local ok, current = pcall(function()
+					return getfpscap()
+				end)
+				original = (ok and typeof(current) == "number") and current or 60
+			end
+			enabled = true
+			apply(cap)
+		else
+			enabled = false
+			if original ~= nil then
+				apply(original)
+				original = nil
+			end
+		end
+		return true
+	end
+
+	function Perf.SetCap(name)
+		cap = CAPS[name] or 240
+		if enabled then
+			apply(cap)
+		end
+	end
+
+	function Perf.Unload()
+		Perf.Set(false)
+	end
+end
+
+local FPS = { value = 0 }
+do
+	local frames, last = 0, os.clock()
+	connect(RunService.RenderStepped, function()
+		frames += 1
+	end)
+	-- frames per second since the previous call (keeps the last value if called too soon)
+	function FPS.Sample()
+		local now = os.clock()
+		local dt = now - last
+		if dt >= 0.25 then
+			FPS.value = frames / dt
+			frames = 0
+			last = now
+		end
+		return FPS.value
+	end
+end
+
+---------------------------------------------------------------------
 -- Tools tab
 ---------------------------------------------------------------------
 local toolsTab = addTab("Tools")
@@ -3504,12 +3992,54 @@ worldTab:Button("Execute Dex", function(lbl)
 end)
 worldTab:Label("Loads Dex explorer from GitHub. Once it's running, the button won't start a second copy.")
 
+local utilityTab = addTab("Utility")
+utilityTab:Section("Server")
+utilityTab:Button("Rejoin", function()
+	Server.Rejoin()
+end)
+utilityTab:Button("Server hop", function()
+	Server.Hop()
+end)
+utilityTab:Label("Rejoin returns to this server (or a fresh one if you're alone in it). Server hop moves you to a different public server that isn't full.")
+
+utilityTab:Section("Anti-AFK")
+utilityTab:Toggle("Anti-AFK", false, function(state)
+	AntiAFK.Set(state)
+	notify("Anti-AFK " .. (state and "on" or "off"), state and "success" or "info")
+end, "util.antiafk")
+utilityTab:Label("Answers Roblox's idle check so you don't get kicked after 20 minutes of no input.")
+
+utilityTab:Section("Performance")
+local fpsToggle = utilityTab:Toggle("FPS unlocker", false, function(state)
+	Perf.Set(state)
+	notify("FPS unlocker " .. (state and "on" or "off"), state and "success" or "info")
+end, "util.fpsUnlock")
+utilityTab:Choice("FPS cap", { "60", "120", "240", "Max" }, "240", function(name)
+	Perf.SetCap(name)
+	notify("FPS cap: " .. (name == "Max" and "uncapped" or name))
+end, "util.fpsCap")
+if not Perf.Supported() then
+	fpsToggle.SetEnabled(false, "No setfpscap")
+end
+utilityTab:Label("Raises Roblox's frame rate limit. Turning it off puts the limit back to what it was. The live FPS is in Settings > Info.")
+
 local settingsTab = addTab("Settings")
 settingsTab:Section("Interface")
 settingsTab:Toggle("Background blur", true, function(state)
 	blurEnabled = state
 	setBlur(true)
 end, "ui.blur")
+settingsTab:Toggle("Notifications", true, function(state)
+	notifyEnabled = state
+	if state then
+		notify("Notifications on", "success")
+	end
+end, "ui.notifications")
+settingsTab:Keybind("Toggle key", "RightShift", function(name)
+	toggleKey = name ~= "None" and Enum.KeyCode[name] or nil
+	notify("Toggle key: " .. name)
+end, "ui.toggleKey")
+settingsTab:Label("Tap Toggle key, then press a key. Esc cancels, Backspace removes the key. Pick one the game doesn't use, since it also fires while you play.")
 local keepToggle = settingsTab:Toggle("Keep options", savedData.keep, function(state)
 	keepEnabled = state
 	if state then
@@ -3696,6 +4226,7 @@ suncRow = settingsTab:InfoRow("sUNC test", "Tap to run", function()
 end)
 local timeRow = settingsTab:InfoRow("Time in game", "00:00:00", copyValue)
 local pingRow = settingsTab:InfoRow("Ping", "N/A", copyValue)
+local fpsRow = settingsTab:InfoRow("FPS", "--", copyValue)
 settingsTab:InfoRow("Display name", player.DisplayName, copyValue)
 settingsTab:InfoRow("Username", player.Name, copyValue)
 settingsTab:InfoRow("User ID", tostring(player.UserId), copyValue)
@@ -3711,6 +4242,7 @@ task.spawn(function()
 		timeRow.Set(formatDuration(time()))
 		local ms = getPingMs()
 		pingRow.Set(ms and (math.floor(ms + 0.5) .. " ms") or "N/A")
+		fpsRow.Set(tostring(math.floor(FPS.Sample() + 0.5)))
 		raknetRow.Set(raknetState())
 		task.wait(1)
 	end
@@ -3854,6 +4386,8 @@ function Toolx.Close()
 	pcall(saveOptions) -- flush anything still waiting to be written
 	pcall(Desync.Unload)
 	pcall(Mods.Unload)
+	pcall(AntiAFK.Unload)
+	pcall(Perf.Unload)
 	pcall(ChatLog.Stop)
 	pcall(LoadLogger.Stop)
 	pcall(Topbar.Unload)
@@ -3881,6 +4415,8 @@ end
 Toolx.Minimize = minimize
 Toolx.Restore = restore
 Toolx.AddTab = addTab
+Toolx.Notify = notify
+Toolx.Version = VERSION
 Toolx.Gui = gui
 
 connect(minBtn.Activated, minimize)
@@ -3889,10 +4425,10 @@ connect(pillHit.Activated, restore)
 connect(pillClose.Activated, Toolx.Close)
 
 connect(UserInputService.InputBegan, function(input, processed)
-	if processed or closing then
+	if processed or closing or capturingKey then
 		return
 	end
-	if input.KeyCode == Enum.KeyCode.RightShift then
+	if toggleKey and input.KeyCode == toggleKey then
 		if minimized then
 			restore()
 		else

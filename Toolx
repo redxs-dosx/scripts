@@ -1889,6 +1889,171 @@ do
 			notify("Your character isn't loaded", "error")
 		end
 	end
+
+	---------------------------------------------------------------------
+	-- Fling helpers
+	---------------------------------------------------------------------
+
+	-- Returns true if the target player's root has significant velocity,
+	-- which is a good proxy for "they are currently being flung / mid-air fast".
+	local FLING_SPEED_THRESHOLD = 80  -- studs/s; tweak if needed
+
+	local function isFlung(target)
+		local root = getRoot(target.Character)
+		if not root then
+			return false
+		end
+		return root.AssemblyLinearVelocity.Magnitude >= FLING_SPEED_THRESHOLD
+	end
+
+	-- Sits on top of the target for a moment to fling them, then polls until
+	-- they are clearly moving fast (flung) or a timeout expires.
+	-- Returns true if the fling appeared to succeed.
+	local function doFling(target)
+		local myChar = player.Character
+		local myRoot = getRoot(myChar)
+		if not myRoot then
+			return false
+		end
+		local targetRoot = getRoot(target.Character)
+		if not targetRoot then
+			return false
+		end
+
+		-- Teleport on top of the target
+		local cf = targetRoot.CFrame * CFrame.new(0, 0.5, 0)
+		pcall(function()
+			myChar:PivotTo(cf)
+		end)
+
+		-- Apply a large upward impulse from our root onto theirs via seat trick:
+		-- We use AssemblyLinearVelocity directly since we're in the same client.
+		-- On most games this is enough to send the target flying.
+		local ok = pcall(function()
+			myRoot.AssemblyLinearVelocity = Vector3.new(0, 350, 0)
+			targetRoot.AssemblyLinearVelocity = Vector3.new(
+				math.random(-120, 120),
+				500,
+				math.random(-120, 120)
+			)
+		end)
+		if not ok then
+			return false
+		end
+
+		-- Wait up to 2.5 s for the fling to register
+		local deadline = os.clock() + 2.5
+		repeat
+			task.wait(0.1)
+			if isFlung(target) then
+				return true
+			end
+		until os.clock() >= deadline
+
+		-- Fall back: check one last time
+		return isFlung(target)
+	end
+
+	-- Fling a single named player; return to origin afterward.
+	function Teleport.FlingPlayer(target)
+		if not target or not target.Parent then
+			notify("That player left", "warn")
+			return
+		end
+		if not getRoot(target.Character) then
+			notify(target.DisplayName .. " isn't loaded yet", "warn")
+			return
+		end
+		local myChar = player.Character
+		local myRoot = getRoot(myChar)
+		if not myRoot then
+			notify("Your character isn't loaded", "error")
+			return
+		end
+
+		-- Remember where we are so we can return after
+		local origin = myRoot.CFrame
+
+		notify("Flinging " .. target.DisplayName .. "...", "info")
+		local success = doFling(target)
+
+		-- Wait until the target is visibly launched or a safety timeout elapses
+		if success then
+			-- Give it a moment so the velocity propagates before we teleport back
+			task.wait(0.3)
+		end
+
+		-- Return to origin
+		moveTo(origin)
+
+		if success then
+			notify("Flung " .. target.DisplayName .. "!", "success")
+		else
+			notify("Fling may not have worked on " .. target.DisplayName, "warn")
+		end
+	end
+
+	-- Fling every other player in the server one by one, returning to origin between each.
+	function Teleport.FlingAll(lbl)
+		local myChar = player.Character
+		local myRoot = getRoot(myChar)
+		if not myRoot then
+			notify("Your character isn't loaded", "error")
+			return
+		end
+
+		local origin = myRoot.CFrame
+		local others = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= player then
+				table.insert(others, p)
+			end
+		end
+
+		if #others == 0 then
+			notify("No other players to fling", "warn")
+			return
+		end
+
+		local original = lbl and lbl.Text or nil
+		local done, failed = 0, 0
+		for i, target in ipairs(others) do
+			if lbl and lbl.Parent then
+				lbl.Text = string.format("Flinging %d/%d...", i, #others)
+			end
+
+			if not target or not target.Parent then
+				failed += 1
+			elseif not getRoot(target.Character) then
+				notify(target.DisplayName .. " isn't loaded, skipping", "warn")
+				failed += 1
+			else
+				local success = doFling(target)
+				if success then
+					done += 1
+					task.wait(0.3)
+				else
+					failed += 1
+				end
+				-- Return to origin before the next target
+				moveTo(origin)
+				task.wait(0.15)
+			end
+		end
+
+		-- Final return to origin
+		moveTo(origin)
+
+		if lbl and lbl.Parent then
+			lbl.Text = original or "Fling all"
+		end
+
+		if failed == 0 then
+			notify(string.format("Flung all %d players!", done), "success")
+		else
+			notify(string.format("Flung %d / %d players (%d failed)", done, #others, failed), done > 0 and "warn" or "error")
+		end
+	end
 end
 
 ---------------------------------------------------------------------
@@ -4059,6 +4224,46 @@ playerTab:Button("Teleport to spawn", function()
 end)
 local playerListBox = playerTab:LogBox(150, 100, "No other players")
 playerTab:Label("Tap a player to teleport next to them. Tap Teleport to spawn again to cycle through the spawns if there are several.")
+
+playerTab:Section("Fling")
+playerTab:Button("Fling all", function(lbl)
+	Teleport.FlingAll(lbl)
+end, true)
+local flingListBox = playerTab:LogBox(150, 100, "No other players")
+playerTab:Label("Tap a player to fling them. You are returned to your original spot once the fling is confirmed (or after a short timeout). Fling all does the same for every player in the server, one by one.")
+
+local flingListToken = 0
+local function refreshFlingList()
+	flingListToken += 1
+	local id = flingListToken
+	task.delay(0.2, function()
+		if id ~= flingListToken or not gui.Parent then
+			return
+		end
+		flingListBox.Clear()
+		local others = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= player then
+				table.insert(others, p)
+			end
+		end
+		table.sort(others, function(a, b)
+			return a.DisplayName:lower() < b.DisplayName:lower()
+		end)
+		for _, p in ipairs(others) do
+			local text = escapeRich(p.DisplayName)
+			if p.DisplayName ~= p.Name then
+				text = text .. ' <font color="#9090a6">@' .. escapeRich(p.Name) .. "</font>"
+			end
+			flingListBox.Add(text, function()
+				task.spawn(Teleport.FlingPlayer, p)
+			end)
+		end
+	end)
+end
+connect(Players.PlayerAdded, refreshFlingList)
+connect(Players.PlayerRemoving, refreshFlingList)
+refreshFlingList()
 
 local listToken = 0
 local function refreshPlayerList()

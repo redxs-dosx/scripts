@@ -479,6 +479,19 @@ local sidebar = new("Frame", {
 	BorderSizePixel = 0,
 }, main)
 
+local sidebarScroll = new("ScrollingFrame", {
+	Name = "SidebarScroll",
+	Size = UDim2.new(1, 0, 1, -24), -- leaves room for the version label
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 2,
+	ScrollBarImageColor3 = theme.accent,
+	ScrollBarImageTransparency = 0.4,
+	CanvasSize = UDim2.new(),
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	ElasticBehavior = Enum.ElasticBehavior.Never,
+}, sidebar)
+
 local indicator = new("Frame", {
 	Name = "Indicator",
 	Position = UDim2.new(0, 8, 0, 10),
@@ -486,7 +499,7 @@ local indicator = new("Frame", {
 	BackgroundColor3 = theme.accent,
 	BackgroundTransparency = 0.82,
 	BorderSizePixel = 0,
-}, sidebar)
+}, sidebarScroll)
 corner(indicator, 8)
 local indicatorBar = new("Frame", {
 	AnchorPoint = Vector2.new(0, 0.5),
@@ -532,6 +545,15 @@ local function selectTab(tab)
 
 	tween(indicator, 0.35, { Position = UDim2.new(0, 8, 0, tab.y) })
 
+	-- keep the selected tab in view when the sidebar is scrolled
+	local viewH = sidebarScroll.AbsoluteWindowSize.Y
+	local top = sidebarScroll.CanvasPosition.Y
+	if tab.y < top then
+		tween(sidebarScroll, 0.3, { CanvasPosition = Vector2.new(0, math.max(tab.y - 10, 0)) })
+	elseif tab.y + 32 > top + viewH then
+		tween(sidebarScroll, 0.3, { CanvasPosition = Vector2.new(0, tab.y + 42 - viewH) })
+	end
+
 	for _, t in ipairs(tabs) do
 		tween(t.button, 0.2, { TextColor3 = (t == tab) and theme.text or theme.dim })
 		if t ~= tab and t.page.Visible then
@@ -565,8 +587,9 @@ local function addTab(name)
 		BackgroundTransparency = 1,
 		Position = UDim2.new(0, 8, 0, y),
 		Size = UDim2.new(1, -16, 0, 32),
-	}, sidebar)
+	}, sidebarScroll)
 	new("UIPadding", { PaddingLeft = UDim.new(0, 14) }, button)
+	sidebarScroll.CanvasSize = UDim2.fromOffset(0, y + 32 + 10)
 
 	local page = new("CanvasGroup", {
 		Name = name,

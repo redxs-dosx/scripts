@@ -1894,110 +1894,107 @@ do
 	-- Fling helpers
 	---------------------------------------------------------------------
 
-	-- How long we stay glued to the target blasting velocity (seconds).
-	-- 3 s is more than enough to send anyone into orbit reliably.
-	local FLING_DURATION    = 3.0
-	-- How high (studs) above their spawn Y the target must be before we
-	-- consider them "definitely flung" and stop early.
-	local FLING_HEIGHT      = 40
-	-- Velocity applied to the target's root every Heartbeat tick.
-	-- We keep reapplying it so the physics engine can't cancel it out.
-	local FLING_VEL_UP      = 500   -- Y component  (studs/s)
-	local FLING_VEL_HORIZ   = 180   -- max horizontal scatter (studs/s)
+	-- How long to keep the seat active before cleaning up (seconds).
+	-- The seat does all the work; we just need to hold on long enough
+	-- for the server to register the velocity.
+	local FLING_DURATION = 4.0
 
-	-- Returns the Y position the target was at when they last touched the
-	-- ground, used as the reference for height-based "flung" detection.
-	-- Falls back to 0 if we can't read it.
-	local function groundY(target)
-		local char = target.Character
-		if not char then
-			return 0
-		end
-		local hum = char:FindFirstChildOfClass("Humanoid")
-		-- FloorMaterial is not None while standing on something
-		if hum and hum.FloorMaterial ~= Enum.Material.Air then
-			local root = getRoot(char)
-			return root and root.Position.Y or 0
-		end
-		-- If already in the air, best we can do is use current Y
-		local root = getRoot(char)
-		return root and root.Position.Y or 0
-	end
-
-	-- Core fling routine.  Runs in a tight Heartbeat loop for up to
-	-- FLING_DURATION seconds, keeping us welded on top of the target
-	-- and hammering their root with velocity every single physics step.
-	-- Returns true once the target is clearly airborne and high up.
+	-- Core fling routine using a temporary Seat part.
+	--
+	-- Why seats work when direct velocity doesn't:
+	--   When a Humanoid sits in a Seat, Roblox's physics engine uses the
+	--   Seat's own AssemblyLinearVelocity to drive the character rather
+	--   than recalculating it from scratch each step.  That means we can
+	--   hammer velocity onto the Seat every Heartbeat and the server will
+	--   honour it — unlike a direct write to the character's RootPart,
+	--   which the server silently discards because it owns that simulation.
+	--
+	-- The sequence:
+	--   1. Spawn a Seat at the target's position and weld it to their root.
+	--   2. Force our own character to sit in the seat (this is the trigger —
+	--      a seated humanoid is moved by its seat).
+	--   3. Every Heartbeat, set the seat's velocity to a large upward vector.
+	--   4. After FLING_DURATION seconds (or once they're clearly airborne),
+	--      destroy the seat and let gravity do the rest.
+	--
+	-- Returns true if the target appeared to leave the ground.
 	local function doFling(target)
 		local myChar = player.Character
 		local myRoot = getRoot(myChar)
 		if not myRoot then
 			return false
 		end
-		local targetRoot = getRoot(target.Character)
+		local targetChar = target.Character
+		local targetRoot = getRoot(targetChar)
 		if not targetRoot then
 			return false
 		end
+		local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
+		if not targetHum then
+			return false
+		end
 
-		-- Snapshot ground level before we start moving them
-		local baseY = groundY(target)
+		local baseY = targetRoot.Position.Y
 
-		-- Pick a random horizontal scatter direction once so it stays
-		-- consistent rather than jittering every frame
-		local hx = (math.random() * 2 - 1) * FLING_VEL_HORIZ
-		local hz = (math.random() * 2 - 1) * FLING_VEL_HORIZ
+		-- 1. Create a temporary Seat welded to the target's root
+		local seat = Instance.new("Seat")
+		seat.Anchored    = false
+		seat.CanCollide  = false
+		seat.Transparency = 1
+		seat.Size        = Vector3.new(1, 1, 1)
+		seat.CFrame      = targetRoot.CFrame
+		seat.Parent      = workspace
 
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0  = seat
+		weld.Part1  = targetRoot
+		weld.Parent = seat
+
+		-- 2. Force the target's humanoid to sit
+		--    seat:Sit() is the documented API; it tells the humanoid to
+		--    treat this seat as its current seat and locks its position to it.
+		pcall(function()
+			seat:Sit(targetHum)
+		end)
+
+		-- 3. Hammer velocity every Heartbeat
 		local startTime = os.clock()
 		local flung     = false
 		local conn
 
+		-- Randomise horizontal direction once so the trajectory is consistent
+		local angle = math.random() * math.pi * 2
+		local hMag  = 120
+		local hx    = math.cos(angle) * hMag
+		local hz    = math.sin(angle) * hMag
+
 		conn = RunService.Heartbeat:Connect(function()
-			-- Stop if target left or time expired
-			if not target.Parent or not target.Character then
+			local elapsed = os.clock() - startTime
+
+			-- Abort early if target left or seat was destroyed
+			if not target.Parent or not target.Character
+				or not seat.Parent or elapsed >= FLING_DURATION then
 				conn:Disconnect()
 				return
 			end
+
+			-- Drive the seat upward every single physics step
+			pcall(function()
+				seat.AssemblyLinearVelocity = Vector3.new(hx, 500, hz)
+				-- Also push our own root so we stay co-located and
+				-- the weld keeps pulling the target with us
+				myRoot.AssemblyLinearVelocity = Vector3.new(hx, 500, hz)
+			end)
+
+			-- Early-exit once they're clearly off the ground
 			local tr = getRoot(target.Character)
-			local mr = getRoot(player.Character)
-			if not tr or not mr then
-				conn:Disconnect()
-				return
-			end
-
-			-- Weld ourselves on top of the target every frame so we keep
-			-- pushing against them rather than drifting away
-			pcall(function()
-				player.Character:PivotTo(tr.CFrame * CFrame.new(0, 1, 0))
-			end)
-
-			-- Blast velocity onto both roots every frame.
-			-- Applying it to our own root as well creates a sustained
-			-- collision force that the server can't easily reject.
-			pcall(function()
-				tr.AssemblyLinearVelocity  = Vector3.new(hx, FLING_VEL_UP, hz)
-				mr.AssemblyLinearVelocity  = Vector3.new(hx, FLING_VEL_UP, hz)
-			end)
-
-			-- Height-based "definitely flung" check: much more reliable than
-			-- a velocity read because velocity can momentarily dip to zero
-			-- even while the character is sailing through the air.
-			local heightGained = tr.Position.Y - baseY
-			local elapsed      = os.clock() - startTime
-
-			if heightGained >= FLING_HEIGHT then
+			if tr and (tr.Position.Y - baseY) >= 30 then
 				flung = true
-				conn:Disconnect()
-				return
-			end
-
-			if elapsed >= FLING_DURATION then
-				-- Time's up — call it a success if they're at least off the ground
-				flung = heightGained > 5
 				conn:Disconnect()
 			end
 		end)
 
-		-- Block until the Heartbeat loop finishes
+		-- Block until the loop finishes (max FLING_DURATION + small buffer)
 		local deadline = os.clock() + FLING_DURATION + 0.5
 		repeat
 			task.wait(0.05)
@@ -2005,6 +2002,17 @@ do
 
 		if conn.Connected then
 			conn:Disconnect()
+		end
+
+		-- 4. Clean up — destroy the seat; the target now flies free
+		pcall(function()
+			seat:Destroy()
+		end)
+
+		-- Check if they actually got air
+		local tr = getRoot(target.Character)
+		if not flung and tr then
+			flung = (tr.Position.Y - baseY) > 8
 		end
 
 		return flung

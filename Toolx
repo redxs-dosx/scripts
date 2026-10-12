@@ -16,7 +16,7 @@
 		Toolx.Notify("text", "info" | "success" | "warn" | "error")
 ]]
 
-local VERSION = "0.3"
+local VERSION = "0.4"
 
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
@@ -1155,6 +1155,7 @@ local function addTab(name)
 					end
 				end)
 			end
+			return lbl
 		end
 
 		function box.Clear()
@@ -2138,6 +2139,48 @@ do
 			notify("Flung " .. target.DisplayName .. "!", "success")
 		else
 			notify(target.DisplayName .. " resisted (try again)", "warn")
+		end
+	end
+
+	-- Copy every tool the target is holding or carrying into your own backpack.
+	-- Note: Roblox only replicates a player's Backpack to that player, so on most games you can
+	-- only see (and copy) the tool they currently have equipped.
+	function Teleport.TakeTools(target)
+		if not target or not target.Parent then
+			notify("That player left", "warn")
+			return
+		end
+		local myBackpack = player:FindFirstChildOfClass("Backpack")
+		if not myBackpack then
+			notify("Your backpack isn't loaded", "error")
+			return
+		end
+		local sources = {}
+		local theirBackpack = target:FindFirstChildOfClass("Backpack")
+		if theirBackpack then
+			table.insert(sources, theirBackpack)
+		end
+		if target.Character then
+			table.insert(sources, target.Character)
+		end
+		local copied, seen = 0, {}
+		for _, source in ipairs(sources) do
+			for _, item in ipairs(source:GetChildren()) do
+				if item:IsA("Tool") or item:IsA("HopperBin") then
+					local ok = pcall(function()
+						local copy = item:Clone()
+						copy.Parent = myBackpack
+					end)
+					if ok then
+						copied += 1
+					end
+				end
+			end
+		end
+		if copied > 0 then
+			notify(string.format("Took %d tool%s from %s", copied, copied == 1 and "" or "s", target.DisplayName), "success")
+		else
+			notify(target.DisplayName .. " has no tools you can see", "warn")
 		end
 	end
 
@@ -5083,29 +5126,66 @@ playerTab:Toggle("Anti-fling", false, function(state)
 	Mods.SetAntiFling(state)
 end, "protect.antifling")
 
-playerTab:Section("Teleport")
-playerTab:Button("Teleport to spawn", function()
-	Teleport.ToSpawn()
-end)
-local playerListBox = playerTab:LogBox(150, 100, "No other players")
-playerTab:Label("Tap a player to teleport next to them. Tap Teleport to spawn again to cycle through the spawns if there are several.")
+local worldTab = addTab("World")
 
-playerTab:Section("Fling")
-playerTab:Button("Fling all", function(lbl)
+worldTab:Section("Players")
+local selectedLabel = worldTab:Label("Selected: none. Tap a player below, then tap an action.")
+local playersBox = worldTab:LogBox(150, 100, "No other players")
+
+local selectedPlayer = nil
+local playerLines = {} -- player -> { label, text }
+
+local function paintSelection()
+	for p, entry in pairs(playerLines) do
+		if entry.label.Parent then
+			entry.label.Text = (p == selectedPlayer)
+				and ('<font color="#6c80ff"><b>\u{25B6}</b></font> <b>' .. entry.text .. "</b>")
+				or entry.text
+		end
+	end
+	selectedLabel.Text = selectedPlayer
+		and ("Selected: " .. selectedPlayer.DisplayName .. " (@" .. selectedPlayer.Name .. ")")
+		or "Selected: none. Tap a player below, then tap an action."
+end
+
+-- Add a new thing to do to the selected player by adding one line here
+local PlayerActions = {
+	{ name = "Teleport", run = Teleport.ToPlayer },
+	{ name = "Fling", run = Teleport.FlingPlayer },
+	{ name = "Take tools", run = Teleport.TakeTools },
+}
+
+for _, action in ipairs(PlayerActions) do
+	worldTab:Button(action.name, function()
+		if not selectedPlayer or not selectedPlayer.Parent then
+			selectedPlayer = nil
+			paintSelection()
+			notify("Select a player first", "warn")
+			return
+		end
+		action.run(selectedPlayer)
+	end)
+end
+
+worldTab:Section("Extras")
+worldTab:Button("Fling all", function(lbl)
 	Teleport.FlingAll(lbl)
 end, true)
-local flingListBox = playerTab:LogBox(150, 100, "No other players")
-playerTab:Label("Tap a player to fling them. You are returned to your original spot once the fling is confirmed (or after a short timeout). Fling all does the same for every player in the server, one by one.")
+worldTab:Button("Teleport to spawn", function()
+	Teleport.ToSpawn()
+end)
+worldTab:Label("Tap a player, then Teleport (next to them), Fling (you return to your spot afterwards) or Take tools (copies their tools to your backpack; usually only the tool they have equipped is visible to you). Tap Teleport to spawn again to cycle through spawns.")
 
-local flingListToken = 0
-local function refreshFlingList()
-	flingListToken += 1
-	local id = flingListToken
+local playersToken = 0
+local function refreshPlayers()
+	playersToken += 1
+	local id = playersToken
 	task.delay(0.2, function()
-		if id ~= flingListToken or not gui.Parent then
+		if id ~= playersToken or not gui.Parent then
 			return
 		end
-		flingListBox.Clear()
+		playersBox.Clear()
+		table.clear(playerLines)
 		local others = {}
 		for _, p in ipairs(Players:GetPlayers()) do
 			if p ~= player then
@@ -5115,56 +5195,28 @@ local function refreshFlingList()
 		table.sort(others, function(a, b)
 			return a.DisplayName:lower() < b.DisplayName:lower()
 		end)
+		if selectedPlayer and not selectedPlayer.Parent then
+			selectedPlayer = nil
+		end
 		for _, p in ipairs(others) do
 			local text = escapeRich(p.DisplayName)
 			if p.DisplayName ~= p.Name then
 				text = text .. ' <font color="#9090a6">@' .. escapeRich(p.Name) .. "</font>"
 			end
-			flingListBox.Add(text, function()
-				task.spawn(Teleport.FlingPlayer, p)
+			local entry = { text = text }
+			entry.label = playersBox.Add(text, function()
+				selectedPlayer = (selectedPlayer == p) and nil or p
+				paintSelection()
 			end)
+			playerLines[p] = entry
 		end
+		paintSelection()
 	end)
 end
-connect(Players.PlayerAdded, refreshFlingList)
-connect(Players.PlayerRemoving, refreshFlingList)
-refreshFlingList()
+connect(Players.PlayerAdded, refreshPlayers)
+connect(Players.PlayerRemoving, refreshPlayers)
+refreshPlayers()
 
-local listToken = 0
-local function refreshPlayerList()
-	listToken += 1
-	local id = listToken
-	-- short delay so a burst of joins / leaves rebuilds the list once
-	task.delay(0.2, function()
-		if id ~= listToken or not gui.Parent then
-			return
-		end
-		playerListBox.Clear()
-		local others = {}
-		for _, p in ipairs(Players:GetPlayers()) do
-			if p ~= player then
-				table.insert(others, p)
-			end
-		end
-		table.sort(others, function(a, b)
-			return a.DisplayName:lower() < b.DisplayName:lower()
-		end)
-		for _, p in ipairs(others) do
-			local text = escapeRich(p.DisplayName)
-			if p.DisplayName ~= p.Name then
-				text = text .. ' <font color="#9090a6">@' .. escapeRich(p.Name) .. "</font>"
-			end
-			playerListBox.Add(text, function()
-				Teleport.ToPlayer(p)
-			end)
-		end
-	end)
-end
-connect(Players.PlayerAdded, refreshPlayerList)
-connect(Players.PlayerRemoving, refreshPlayerList)
-refreshPlayerList()
-
-local worldTab = addTab("World")
 worldTab:Section("Topbar")
 worldTab:Choice("Topbar style", { "2018", "2021", "Current" }, "Current", function(name)
 	Topbar.Set(name)

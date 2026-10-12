@@ -5409,7 +5409,7 @@ local function getBuiltArguments()
 		elseif item.type == "Boolean" then
 			table.insert(args, item.val:lower() == "true")
 		end
-	}
+	end
 	if #args == 0 then
 		table.insert(args, "Toolx Manual Fire")
 	end
@@ -5901,77 +5901,6 @@ do
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = true
 			dragStart = input.Position
-			startPos = main.Position
-			local c
-			c = input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
-					c:Disconnect()
-				end
-			end)
-		end
-	end)
-
-	connect(titleBar.InputChanged, function(input)
-		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-			dragInput = input
-		end
-	end)
-
-	connect(UserInputService.InputChanged, function(input)
-		if dragging and input == dragInput then
-			local d = input.Position - dragStart
-			main.Position = UDim2.new(
-				startPos.X.Scale, startPos.X.Offset + d.X,
-				startPos.Y.Scale, startPos.Y.Offset + d.Y
-			)
-		end
-	end)
-end
-
----------------------------------------------------------------------
--- Startup: restore saved options, then open the window
----------------------------------------------------------------------
--- Restore saved options (only when "Keep options" was on last time)
-if keepEnabled then
-	loadingOptions = true
-	for key, comp in pairs(registry) do
-		local value = savedData.options[key]
-		local available = not (comp.IsEnabled and not comp.IsEnabled())
-		if value ~= nil and available and typeof(value) == typeof(comp.Get()) then
-			pcall(comp.Set, value)
-		end
-	end
-	loadingOptions = false
-
-	-- make sure the saved topbar really gets applied (size first, then style)
-	local savedStyle = savedData.options["world.topbar"]
-	if savedStyle == "2018" or savedStyle == "2021" then
-		local savedSize = savedData.options["world.topbarSize"]
-		task.spawn(function()
-			task.wait(0.5)
-			if closing then
-				return
-			end
-			if typeof(savedSize) == "number" then
-				pcall(Topbar.SetScale, savedSize)
-			end
-			pcall(Topbar.Set, savedStyle)
-		end)
-	end
-end
-
-selectTab(mainTab)
-tween(main, 0.4, { GroupTransparency = 0 })
-tween(mainScale, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
-setBlur(true)
-
-pcall(function()
-	getgenv().Toolx = Toolx
-end)
-
-return Toolx
-dragStart = input.Position
 			startPos = main.Position
 			local c
 			c = input.Changed:Connect(function()

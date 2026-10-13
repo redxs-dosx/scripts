@@ -5012,6 +5012,295 @@ end
 ---------------------------------------------------------------------
 -- Tools tab
 ---------------------------------------------------------------------
+---------------------------------------------------------------------
+-- ESP + health meter
+---------------------------------------------------------------------
+local ESP = {}
+do
+	local settings = {
+		esp = false,
+		names = true,
+		useDisplay = true,
+		outline = true, -- true = full outline, false = hitbox
+		teamName = false,
+		health = false,
+	}
+	local entries = {} -- Player -> entry
+	local container
+	local heartbeat
+	local accum = 0
+
+	local function getContainer()
+		if container and container.Parent then
+			return container
+		end
+		container = new("Folder", { Name = "ToolxESP" })
+		local parent = gui.Parent or game:GetService("CoreGui")
+		local ok = pcall(function()
+			container.Parent = parent
+		end)
+		if not ok or container.Parent ~= parent then
+			container.Parent = gui
+		end
+		return container
+	end
+
+	-- always the colour of the team the player is assigned to (white if they have no team)
+	local function teamColor(p)
+		local t = p.Team
+		if t then
+			return t.TeamColor.Color
+		end
+		return Color3.new(1, 1, 1)
+	end
+
+	local function makeEntry(p)
+		local folder = new("Folder", { Name = p.Name }, getContainer())
+		local e = { player = p, folder = folder }
+
+		e.highlight = new("Highlight", {
+			Name = "Outline",
+			FillTransparency = 1,
+			OutlineTransparency = 0,
+			DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+			Enabled = false,
+		}, folder)
+
+		e.box = new("SelectionBox", {
+			Name = "Hitbox",
+			LineThickness = 0.04,
+			Transparency = 0,
+			SurfaceTransparency = 0.85,
+		}, folder)
+
+		e.infoGui = new("BillboardGui", {
+			Name = "Info",
+			AlwaysOnTop = true,
+			LightInfluence = 0,
+			ResetOnSpawn = false,
+			Size = UDim2.fromOffset(200, 36),
+			StudsOffset = Vector3.new(0, 2.8, 0),
+			Enabled = false,
+		}, folder)
+		e.nameLabel = new("TextLabel", {
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0.5, 0),
+			Font = Enum.Font.GothamBold,
+			TextSize = 14,
+			TextYAlignment = Enum.TextYAlignment.Bottom,
+			TextStrokeTransparency = 0.3,
+			Text = "",
+		}, e.infoGui)
+		e.teamLabel = new("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromScale(0, 0.5),
+			Size = UDim2.new(1, 0, 0.5, 0),
+			Font = Enum.Font.GothamMedium,
+			TextSize = 12,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			TextStrokeTransparency = 0.3,
+			Text = "",
+		}, e.infoGui)
+
+		e.hpGui = new("BillboardGui", {
+			Name = "Health",
+			AlwaysOnTop = true,
+			LightInfluence = 0,
+			ResetOnSpawn = false,
+			Size = UDim2.fromOffset(64, 18),
+			StudsOffset = Vector3.new(0, -3.6, 0),
+			Enabled = false,
+		}, folder)
+		local back = new("Frame", {
+			BackgroundColor3 = Color3.new(0, 0, 0),
+			BackgroundTransparency = 0.35,
+			BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 0, 6),
+		}, e.hpGui)
+		corner(back, 3)
+		e.hpFill = new("Frame", {
+			BorderSizePixel = 0,
+			Size = UDim2.fromScale(1, 1),
+		}, back)
+		corner(e.hpFill, 3)
+		e.hpText = new("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(0, 7),
+			Size = UDim2.new(1, 0, 0, 11),
+			Font = Enum.Font.GothamBold,
+			TextSize = 10,
+			TextColor3 = Color3.new(1, 1, 1),
+			TextStrokeTransparency = 0.4,
+			Text = "",
+		}, e.hpGui)
+
+		return e
+	end
+
+	local function hideEsp(e)
+		e.highlight.Enabled = false
+		e.highlight.Adornee = nil
+		e.box.Adornee = nil
+		e.infoGui.Enabled = false
+	end
+
+	local function hideHealth(e)
+		e.hpGui.Enabled = false
+	end
+
+	local function updateEntry(e)
+		local p = e.player
+		local char = p.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local root = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
+		local alive = hum ~= nil and root ~= nil and hum.Health > 0
+		local color = teamColor(p)
+
+		-- ESP (outline / hitbox, names, team name)
+		if settings.esp and alive then
+			if settings.outline then
+				e.box.Adornee = nil
+				e.highlight.Adornee = char
+				e.highlight.OutlineColor = color
+				e.highlight.FillColor = color
+				e.highlight.Enabled = true
+			else
+				e.highlight.Enabled = false
+				e.highlight.Adornee = nil
+				e.box.Adornee = char
+				e.box.Color3 = color
+				e.box.SurfaceColor3 = color
+			end
+
+			local showName = settings.names
+			local showTeam = settings.teamName and p.Team ~= nil
+			if showName or showTeam then
+				e.infoGui.Adornee = char:FindFirstChild("Head") or root
+				e.infoGui.Enabled = true
+				e.nameLabel.Visible = showName
+				e.nameLabel.Text = settings.useDisplay and p.DisplayName or p.Name
+				e.nameLabel.TextColor3 = color
+				e.teamLabel.Visible = showTeam
+				e.teamLabel.Text = showTeam and p.Team.Name or ""
+				e.teamLabel.TextColor3 = color
+			else
+				e.infoGui.Enabled = false
+			end
+		else
+			hideEsp(e)
+		end
+
+		-- health meter (works without ESP)
+		if settings.health and alive and hum.MaxHealth > 0 then
+			local frac = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+			e.hpGui.Adornee = root
+			e.hpGui.Enabled = true
+			e.hpFill.Size = UDim2.fromScale(frac, 1)
+			e.hpFill.BackgroundColor3 = Color3.fromHSV(frac * 0.33, 0.85, 0.95)
+			e.hpText.Text = math.ceil(hum.Health) .. "/" .. math.ceil(hum.MaxHealth)
+		else
+			hideHealth(e)
+		end
+	end
+
+	local function clearAll()
+		for p, e in pairs(entries) do
+			pcall(function()
+				e.folder:Destroy()
+			end)
+			entries[p] = nil
+		end
+	end
+
+	local function step()
+		local present = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= player then
+				present[p] = true
+				local e = entries[p]
+				if not e then
+					e = makeEntry(p)
+					entries[p] = e
+				end
+				pcall(updateEntry, e)
+			end
+		end
+		for p, e in pairs(entries) do
+			if not present[p] then
+				pcall(function()
+					e.folder:Destroy()
+				end)
+				entries[p] = nil
+			end
+		end
+	end
+
+	local function sync()
+		local need = settings.esp or settings.health
+		if need and not heartbeat then
+			accum = 1
+			heartbeat = RunService.Heartbeat:Connect(function(dt)
+				accum = accum + dt
+				if accum < 0.1 then
+					return
+				end
+				accum = 0
+				step()
+			end)
+		elseif not need and heartbeat then
+			heartbeat:Disconnect()
+			heartbeat = nil
+			clearAll()
+		end
+	end
+
+	function ESP.SetEnabled(on)
+		settings.esp = on
+		sync()
+		if not on then
+			for _, e in pairs(entries) do
+				hideEsp(e)
+			end
+		end
+	end
+	function ESP.SetNames(on)
+		settings.names = on
+	end
+	function ESP.SetNameType(name)
+		settings.useDisplay = name == "Display name"
+	end
+	function ESP.SetStyle(name)
+		settings.outline = name == "Full outline"
+	end
+	function ESP.SetTeamName(on)
+		settings.teamName = on
+	end
+	function ESP.SetHealth(on)
+		settings.health = on
+		sync()
+		if not on then
+			for _, e in pairs(entries) do
+				hideHealth(e)
+			end
+		end
+	end
+	function ESP.Unload()
+		settings.esp = false
+		settings.health = false
+		if heartbeat then
+			heartbeat:Disconnect()
+			heartbeat = nil
+		end
+		clearAll()
+		if container then
+			pcall(function()
+				container:Destroy()
+			end)
+			container = nil
+		end
+	end
+end
+
 local toolsTab = addTab("Tools")
 toolsTab:Section("Console")
 toolsTab:Button("Open console", function(lbl)
@@ -5131,6 +5420,30 @@ toolsTab:Button("Clear loadlogger", function(lbl)
 	loadBox.Clear()
 	flashLabel(lbl, "Cleared")
 end)
+
+toolsTab:Section("ESP")
+toolsTab:Label("Outlines and labels are coloured by each player's assigned team (white if they have none).")
+toolsTab:Toggle("ESP", false, function(state)
+	ESP.SetEnabled(state)
+end, "esp.enabled")
+toolsTab:Toggle("Show names", true, function(state)
+	ESP.SetNames(state)
+end, "esp.names")
+toolsTab:Choice("Name type", { "Display name", "Username" }, "Display name", function(name)
+	ESP.SetNameType(name)
+end, "esp.nameType")
+toolsTab:Choice("ESP style", { "Hitbox", "Full outline" }, "Full outline", function(name)
+	ESP.SetStyle(name)
+end, "esp.style")
+toolsTab:Toggle("Show team name", false, function(state)
+	ESP.SetTeamName(state)
+end, "esp.teamName")
+
+toolsTab:Section("Health meter")
+toolsTab:Label("Shows a health bar under every player. Works on its own, ESP doesn't need to be on.")
+toolsTab:Toggle("Health meter", false, function(state)
+	ESP.SetHealth(state)
+end, "esp.health")
 
 ---------------------------------------------------------------------
 -- Player tab
@@ -5919,6 +6232,7 @@ function Toolx.Close()
 	pcall(Desync.Unload)
 	pcall(Mods.Unload)
 	pcall(AntiAFK.Unload)
+	pcall(ESP.Unload)
 	pcall(Perf.Unload)
 	pcall(ChatLog.Stop)
 	pcall(LoadLogger.Stop)

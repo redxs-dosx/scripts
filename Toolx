@@ -934,6 +934,184 @@ local function addTab(name)
 		return comp
 	end
 
+	-- A row that drops open to a short list. Tap it, pick an option and that option turns on (only one at a time).
+	-- Tap the row again to turn it off. The list closes when you scroll or tap anywhere else.
+	-- callback(optionName or nil) fires whenever it changes; Set(name or nil) / Get() control it from code.
+	function api:DropToggle(text, options, callback)
+		local HEAD, OPT, GAP = 38, 30, 4
+		local openH = HEAD + GAP + #options * (OPT + GAP)
+
+		local wrap = new("Frame", {
+			Size = UDim2.new(1, 0, 0, HEAD),
+			BackgroundTransparency = 1,
+			ClipsDescendants = true,
+			LayoutOrder = nextOrder(),
+		}, scroller)
+		local head = new("TextButton", {
+			Text = "",
+			AutoButtonColor = false,
+			Size = UDim2.new(1, 0, 0, HEAD),
+			BackgroundColor3 = theme.surface,
+			BackgroundTransparency = 0.35,
+			BorderSizePixel = 0,
+		}, wrap)
+		corner(head, 8)
+		stroke(head, 0.94)
+		new("TextLabel", {
+			Text = text,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 13,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 0),
+			Size = UDim2.new(0.5, -12, 1, 0),
+		}, head)
+		local status = new("TextLabel", {
+			Text = "Off",
+			Font = Enum.Font.GothamMedium,
+			TextSize = 12,
+			TextColor3 = theme.dim,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -32, 0, 0),
+			Size = UDim2.new(0.5, -32, 1, 0),
+		}, head)
+		local arrow = new("TextLabel", {
+			Text = "v",
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextColor3 = theme.dim,
+			BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -12, 0.5, 0),
+			Size = UDim2.fromOffset(16, 16),
+		}, head)
+
+		local active = nil
+		local open = false
+		local suppressUntil = 0 -- scrolling we do ourselves (to bring the list into view) shouldn't close it
+		local buttons = {}
+
+		local function render()
+			status.Text = active or "Off"
+			tween(status, 0.2, { TextColor3 = active and theme.accent or theme.dim })
+			for opt, b in pairs(buttons) do
+				local on = opt == active
+				tween(b, 0.2, {
+					BackgroundColor3 = on and theme.accent or theme.off,
+					TextColor3 = on and theme.white or theme.dim,
+				})
+			end
+		end
+
+		local function setOpen(v)
+			if open == v then
+				return
+			end
+			open = v
+			tween(wrap, 0.25, { Size = UDim2.new(1, 0, 0, v and openH or HEAD) })
+			tween(arrow, 0.25, { Rotation = v and 180 or 0 })
+			if v then
+				-- scroll down a little if the list would run off the bottom of the page
+				local scale = wrap.AbsoluteSize.Y / HEAD
+				if scale <= 0 then
+					scale = 1
+				end
+				local bottom = wrap.AbsolutePosition.Y + openH * scale
+				local limit = scroller.AbsolutePosition.Y + scroller.AbsoluteSize.Y
+				if bottom > limit then
+					suppressUntil = os.clock() + 0.6
+					tween(scroller, 0.25, {
+						CanvasPosition = Vector2.new(0, scroller.CanvasPosition.Y + (bottom - limit) + 8),
+					})
+				end
+			end
+		end
+
+		local function set(opt, silent)
+			if opt ~= nil and buttons[opt] == nil then
+				return
+			end
+			if opt == active then
+				return
+			end
+			active = opt
+			render()
+			if callback and not silent then
+				task.spawn(callback, opt)
+			end
+		end
+
+		for i, opt in ipairs(options) do
+			local b = new("TextButton", {
+				Text = opt,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 12,
+				TextColor3 = theme.dim,
+				AutoButtonColor = false,
+				BackgroundColor3 = theme.off,
+				BorderSizePixel = 0,
+				Position = UDim2.fromOffset(0, HEAD + GAP + (i - 1) * (OPT + GAP)),
+				Size = UDim2.new(1, 0, 0, OPT),
+			}, wrap)
+			corner(b, 8)
+			buttons[opt] = b
+			connect(b.Activated, function()
+				set(opt)
+				setOpen(false)
+			end)
+		end
+		render()
+
+		connect(head.Activated, function()
+			if active then
+				set(nil) -- already on: tapping again turns it off
+				setOpen(false)
+			else
+				setOpen(not open)
+			end
+		end)
+
+		-- close when the person taps anywhere that isn't this dropdown
+		connect(UserInputService.InputBegan, function(input)
+			if not open then
+				return
+			end
+			local t = input.UserInputType
+			if t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch then
+				return
+			end
+			local p = Vector2.new(input.Position.X, input.Position.Y)
+			if gui.IgnoreGuiInset then
+				p = p + game:GetService("GuiService"):GetGuiInset()
+			end
+			local pos, size = wrap.AbsolutePosition, wrap.AbsoluteSize
+			if p.X < pos.X or p.X > pos.X + size.X or p.Y < pos.Y or p.Y > pos.Y + size.Y then
+				setOpen(false)
+			end
+		end)
+		-- ...or when the page is scrolled / the tab is switched away
+		connect(scroller:GetPropertyChangedSignal("CanvasPosition"), function()
+			if open and os.clock() > suppressUntil then
+				setOpen(false)
+			end
+		end)
+		connect(page:GetPropertyChangedSignal("Visible"), function()
+			if not page.Visible then
+				setOpen(false)
+			end
+		end)
+
+		return {
+			Set = set,
+			Get = function()
+				return active
+			end,
+		}
+	end
+
 	-- Press-a-key picker: tap the row, then press the key to bind it (Esc cancels, Backspace clears).
 	-- Get / Set use the KeyCode name ("RightShift"), or "None". callback(name) fires when it changes.
 	function api:Keybind(text, default, callback, key)
@@ -6091,7 +6269,7 @@ Topbar.OnStatus = function(text)
 end
 worldTab:Label("2018 and 2021 swap Roblox's topbar for a working copy that reaches the screen edges. Current is Roblox's real topbar: it is hidden while a copy is shown and comes back when you pick Current or close Toolx. The two lines above say whether the real topbar was hidden and what the last button you pressed did.")
 
-local utilityTab = addTab("Utility")
+local utilityTab = toolsTab -- everything that was in the Utility tab now lives in Tools
 utilityTab:Section("Server")
 utilityTab:Button("Rejoin", function()
 	Server.Rejoin()
@@ -6123,17 +6301,116 @@ end
 utilityTab:Label("Raises Roblox's frame rate limit. Turning it off puts the limit back to what it was. The live FPS is in Settings > Info.")
 
 ---------------------------------------------------------------------
--- Scanner tab
+-- Noclip (Norm NC = collisions off, Wall TP = teleport through walls)
 ---------------------------------------------------------------------
-local scannerTab = addTab("Scanner")
+local Noclip = {}
+do
+	local conn
+	local saved = {} -- part -> true for parts we switched CanCollide off on
+	local lastTp = 0
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	local overlapParams = OverlapParams.new()
+	overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+	pcall(function()
+		rayParams.RespectCanCollide = true
+		overlapParams.RespectCanCollide = true
+	end)
+
+	local function restore()
+		for part in pairs(saved) do
+			if part.Parent then
+				pcall(function()
+					part.CanCollide = true
+				end)
+			end
+			saved[part] = nil
+		end
+	end
+
+	-- Norm NC: the humanoid keeps turning collisions back on, so switch them off every physics step
+	local function normStep()
+		local char = player.Character
+		if not char then
+			return
+		end
+		for _, part in ipairs(char:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then
+				saved[part] = true
+				part.CanCollide = false
+			end
+		end
+	end
+
+	-- Wall TP: collisions stay on. Walking into a wall moves you to the first free spot on the other side.
+	local function wallStep()
+		local char = player.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not (hum and root) or hum.Health <= 0 then
+			return
+		end
+		local move = hum.MoveDirection
+		local dir = Vector3.new(move.X, 0, move.Z)
+		if dir.Magnitude < 0.1 or os.clock() - lastTp < 0.2 then
+			return
+		end
+		dir = dir.Unit
+
+		rayParams.FilterDescendantsInstances = { char }
+		overlapParams.FilterDescendantsInstances = { char }
+		local hit = workspace:Raycast(root.Position, dir * 3, rayParams)
+		if not hit then
+			return
+		end
+
+		for d = 0.5, 50, 0.5 do
+			local point = hit.Position + dir * d
+			local center = Vector3.new(point.X, root.Position.Y, point.Z)
+			local blocked = workspace:GetPartBoundsInBox(CFrame.new(center), Vector3.new(2.4, 5, 2.4), overlapParams)
+			if #blocked == 0 then
+				lastTp = os.clock()
+				root.CFrame = CFrame.new(center, center + dir)
+				return
+			end
+		end
+	end
+
+	-- mode is "Norm NC", "Wall TP" or nil (off)
+	function Noclip.Set(mode)
+		if conn then
+			conn:Disconnect()
+			conn = nil
+		end
+		restore()
+		if mode == "Norm NC" then
+			conn = RunService.Stepped:Connect(normStep)
+		elseif mode == "Wall TP" then
+			conn = RunService.Heartbeat:Connect(wallStep)
+		end
+	end
+
+	function Noclip.Unload()
+		Noclip.Set(nil)
+	end
+end
+
+utilityTab:Section("Noclip")
+utilityTab:DropToggle("Noclip", { "Norm NC", "Wall TP" }, function(option)
+	Noclip.Set(option)
+	notify(option and ("Noclip: " .. option) or "Noclip off", option and "success" or "info")
+end)
+utilityTab:Label("Norm NC turns your collisions off so you walk straight through walls. Wall TP keeps collisions and teleports you to the other side when you walk into a wall. Only one works at a time. Tap Noclip again to turn it off.")
+
+---------------------------------------------------------------------
+-- Backdoor scanner + payload arguments (lives in the Tools tab)
+---------------------------------------------------------------------
+local scannerTab = toolsTab
 
 scannerTab:Section("Backdoor Scanner")
-scannerTab:Label("Scans ReplicatedStorage and Workspace for responsive remotes. Tap any discovered remote to fire it using your custom arguments.")
-
-local scanResultsBox = scannerTab:LogBox(140, 40, "No scan performed yet")
-
-scannerTab:Section("Payload Arguments")
-scannerTab:Label("Add custom arguments (String, Number, Boolean, Instance, Table) to send when firing remotes.")
+scannerTab:Label("Scans ReplicatedStorage and Workspace for responsive remotes. Add the arguments to send (String, Number, Boolean, Instance, Table) below, then run the scan. Tap any discovered remote to fire it with those arguments.")
+local scanResultsBox -- the results box is created under the Run Scan button
 
 local argRowsContainer = scannerTab:Container()
 new("UIListLayout", {
@@ -6354,6 +6631,8 @@ scannerTab:Button("Run Scan", function(lbl)
 		notify(string.format("Scan complete: found %d responsive remotes", count), "success")
 	end)
 end)
+
+scanResultsBox = scannerTab:LogBox(140, 40, "No scan performed yet")
 
 local settingsTab = addTab("Settings")
 settingsTab:Section("Interface")
@@ -6727,6 +7006,7 @@ function Toolx.Close()
 	pcall(Mods.Unload)
 	pcall(AntiAFK.Unload)
 	pcall(ESP.Unload)
+	pcall(Noclip.Unload)
 	pcall(Perf.Unload)
 	pcall(ChatLog.Stop)
 	pcall(LoadLogger.Stop)

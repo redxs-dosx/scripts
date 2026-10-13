@@ -4305,6 +4305,11 @@ do
 
 	local mode = "Scripts" -- "Scripts" or "Games"
 	local requestId = 0
+	local provider = "ScriptBlox" -- "ScriptBlox" or "Rscripts"
+	local RS = { api = "https://api.rscripts.net/v1/", key = "", keyFile = SAVE_FOLDER .. "/rscripts.key" }
+	local FS = { verified = false, keyless = false, gameMode = "Any game" } -- filter state + helpers
+	local updateFilterRows -- forward declarations, defined below
+	local doSearch
 
 	-----------------------------------------------------------------
 	-- Data helpers
@@ -4437,6 +4442,7 @@ do
 					id = s._id,
 					source = typeof(s.script) == "string" and s.script or nil,
 					game = g and g.name or nil,
+					gameId = g and g.gameId or nil,
 					universal = s.isUniversal == true,
 					verified = s.verified == true,
 					key = s.key == true,
@@ -4472,8 +4478,274 @@ do
 		return list
 	end
 
+
+	-----------------------------------------------------------------
+	-- Filters + Rscripts provider
+	-----------------------------------------------------------------
+	function FS.trim(text)
+		return (tostring(text or ""):match("^%s*(.-)%s*$"))
+	end
+
+	-- Works out the game filter (place id + name). Returns {} for "any game", or nil + an error message.
+	function FS.resolveGame()
+		local gm = FS.gameMode
+		if gm == "Any game" then
+			return {}
+		end
+		local placeId, name
+		if gm == "This game" then
+			placeId = tostring(game.PlaceId)
+		else
+			local text = FS.trim(FS.gameBox and FS.gameBox.Text)
+			if text == "" then
+				return {}
+			end
+			if text:match("^%d+$") then
+				placeId = text
+			else
+				local games, err = searchGames(text)
+				if not (games and games[1]) then
+					return nil, err or ('No game found for "' .. text .. '".')
+				end
+				placeId = tostring(games[1].placeId)
+				name = games[1].name
+			end
+		end
+		if not name then
+			pcall(function()
+				name = game:GetService("MarketplaceService"):GetProductInfo(tonumber(placeId)).Name
+			end)
+		end
+		return { placeId = placeId, name = name }
+	end
+
+	function FS.collect()
+		local f, err = FS.resolveGame()
+		if not f then
+			return nil, err
+		end
+		f.verified = FS.verified
+		f.keyless = FS.keyless
+		return f
+	end
+
+	function FS.active(f)
+		return f.verified or f.keyless or f.placeId ~= nil
+	end
+
+	-- Applies the filters on our side too, so they work even when a provider ignores a parameter
+	function FS.apply(list, f)
+		local out = {}
+		local gname = f.name and f.name:lower() or nil
+		for _, item in ipairs(list) do
+			local keep = true
+			if f.verified and not item.verified then
+				keep = false
+			end
+			if f.keyless and item.key then
+				keep = false
+			end
+			if keep and f.placeId then
+				if item.gameId then
+					keep = tostring(item.gameId) == f.placeId
+				elseif gname and item.game then
+					keep = item.game:lower():find(gname, 1, true) ~= nil
+				else
+					keep = false
+				end
+			end
+			if keep then
+				out[#out + 1] = item
+			end
+		end
+		return out
+	end
+
+	-- Rscripts needs an API key sent as a header, so this goes through request() instead of HttpGet
+	function RS.get(path)
+		if RS.key == "" then
+			return nil, "Rscripts needs an API key. Paste yours in the box above (free from rscripts.net/dashboard/api)."
+		end
+		local req = (typeof(request) == "function" and request)
+			or (typeof(http_request) == "function" and http_request)
+			or (typeof(syn) == "table" and syn.request)
+		if not req then
+			return nil, "Your executor has no request() function, which Rscripts needs for its API key."
+		end
+		local ok, res = pcall(req, {
+			Url = RS.api .. path,
+			Method = "GET",
+			Headers = { ["Authorization"] = "Bearer " .. RS.key, ["Accept"] = "application/json" },
+		})
+		if not ok or typeof(res) ~= "table" then
+			return nil, "Couldn't reach Rscripts. Check that your executor allows HTTP requests."
+		end
+		local status = tonumber(res.StatusCode) or 0
+		if status == 401 then
+			return nil, "Rscripts rejected your API key. Check that you pasted it correctly."
+		end
+		if status == 429 then
+			return nil, "Rscripts rate limit hit. Try again in a minute."
+		end
+		local okJson, data = pcall(function()
+			return HttpService:JSONDecode(res.Body)
+		end)
+		if not okJson or typeof(data) ~= "table" then
+			return nil, "Rscripts sent back something unreadable (status " .. tostring(status) .. ")."
+		end
+		if data.success ~= true then
+			local msg = typeof(data.error) == "table" and data.error.message or data.error or data.message
+			return nil, "Rscripts error: " .. tostring(msg or status)
+		end
+		return data
+	end
+
+	function RS.parse(list)
+		local out = {}
+		if typeof(list) ~= "table" then
+			return out
+		end
+		for _, s in ipairs(list) do
+			if typeof(s) == "table" and s.title then
+				local g = typeof(s.game) == "table" and s.game or nil
+				local c = typeof(s.creator) == "table" and s.creator or nil
+				local r = typeof(s.risk) == "table" and s.risk or nil
+				out[#out + 1] = {
+					provider = "Rscripts",
+					title = tostring(s.title),
+					slug = s.slug,
+					id = s.id,
+					source = (typeof(s.script) == "string" and #s.script > 0) and s.script or nil,
+					rawUrl = typeof(s.rawScript) == "string" and s.rawScript or nil,
+					game = g and g.title and tostring(g.title) or nil,
+					gameId = g and g.placeId or nil,
+					universal = g == nil,
+					verified = c ~= nil and c.isVerified == true,
+					key = s.isKeySystem == true,
+					patched = s.isPatched == true,
+					views = s.views or 0,
+					risk = r and tonumber(r.score) or nil,
+				}
+			end
+		end
+		return out
+	end
+
+	function RS.fetch(query, flt)
+		local hasQuery = query ~= nil and query ~= ""
+		if not hasQuery and not FS.active(flt) then
+			local data, err = RS.get("trending")
+			if not data then
+				return nil, err
+			end
+			local list, seen = {}, {}
+			local d = typeof(data.data) == "table" and data.data or {}
+			for _, group in ipairs({ d.trending, d.rising }) do
+				for _, item in ipairs(RS.parse(group)) do
+					local k = tostring(item.slug or item.title)
+					if not seen[k] then
+						seen[k] = true
+						list[#list + 1] = item
+					end
+				end
+			end
+			if #list == 0 then
+				return nil, "Rscripts returned no trending scripts."
+			end
+			return list
+		end
+
+		local path = "scripts?limit=24"
+		if hasQuery then
+			path = path .. "&q=" .. HttpService:UrlEncode(query)
+		else
+			path = path .. "&sort=trending"
+		end
+		if flt.placeId then
+			path = path .. "&placeId=" .. flt.placeId
+		end
+		if flt.verified then
+			path = path .. "&verifiedOnly=true"
+		end
+		if flt.keyless then
+			path = path .. "&noKeySystem=true"
+		end
+		local data, err = RS.get(path)
+		if not data then
+			return nil, err
+		end
+		local list = FS.apply(RS.parse(data.data), flt)
+		if #list == 0 then
+			return nil, hasQuery and ('No Rscripts scripts found for "' .. query .. '" with these filters.') or "No Rscripts scripts match your filters."
+		end
+		return list
+	end
+
+	function FS.scriptblox(query, flt)
+		local q = query
+		if (q == nil or q == "") and flt.name then
+			q = flt.name -- ScriptBlox has no game filter, so search by the game's name and filter the results
+		end
+		local data
+		if q and q ~= "" then
+			local url = SCRIPTBLOX_API .. "search?q=" .. HttpService:UrlEncode(q) .. "&max=20"
+			if flt.verified then
+				url = url .. "&verified=1"
+			end
+			if flt.keyless then
+				url = url .. "&key=0"
+			end
+			data = fetchJson(url)
+		else
+			data = fetchJson(SCRIPTBLOX_API .. "trending")
+		end
+		if not data then
+			return nil, "Couldn't reach ScriptBlox. Check that your executor allows HTTP requests."
+		end
+		local list = FS.apply(parseScripts(data), flt)
+		if #list == 0 then
+			if FS.active(flt) then
+				return nil, "No ScriptBlox scripts match your filters."
+			end
+			return nil, (q and q ~= "") and ('No scripts found for "' .. q .. '".') or "ScriptBlox returned no trending scripts."
+		end
+		return list
+	end
+
+	function FS.fetch(query, flt)
+		if provider == "Rscripts" then
+			return RS.fetch(query, flt)
+		end
+		return FS.scriptblox(query, flt)
+	end
+
+	pcall(function()
+		if typeof(isfile) == "function" and isfile(RS.keyFile) then
+			RS.key = FS.trim(readfile(RS.keyFile))
+		end
+	end)
+
 	-- Search results usually include the source; otherwise ask the raw endpoint
 	local function getSource(item)
+		if item.provider == "Rscripts" then
+			if item.source then
+				return item.source
+			end
+			if item.rawUrl then
+				local body = fetchUrl(item.rawUrl)
+				if body then
+					return body
+				end
+			end
+			if item.slug then
+				local data = RS.get("scripts/" .. HttpService:UrlEncode(tostring(item.slug)))
+				local d = data and data.data
+				if typeof(d) == "table" and typeof(d.script) == "string" and #d.script > 0 then
+					return d.script
+				end
+			end
+			return nil
+		end
 		if item.source and #item.source > 0 then
 			return item.source
 		end
@@ -4626,6 +4898,7 @@ do
 		end
 		mode = name
 		paintDropText()
+		updateFilterRows()
 		searchBox.Text = ""
 		searchBox.PlaceholderText = "Search " .. string.lower(mode) .. "..."
 		load(nil)
@@ -4661,6 +4934,215 @@ do
 	connect(dropHead.Activated, function()
 		setDropdown(not dropOpen)
 	end)
+
+	-----------------------------------------------------------------
+	-- Provider + filter dropdowns (Scripts mode only)
+	-----------------------------------------------------------------
+	function FS.dropRow(specs)
+		local HEAD, OPT, GAP = 32, 26, 4
+		local count = #specs
+		local row = mainTab:Container(HEAD)
+		local drops = {}
+
+		local function relayout()
+			local maxH = HEAD
+			for _, d in ipairs(drops) do
+				local h = d.open and (HEAD + GAP + #d.options * (OPT + GAP)) or HEAD
+				tween(d.frame, 0.25, { Size = UDim2.new(1 / count, count > 1 and -3 or 0, 0, h) })
+				tween(d.arrow, 0.25, { Rotation = d.open and 180 or 0 })
+				if h > maxH then
+					maxH = h
+				end
+			end
+			tween(row, 0.25, { Size = UDim2.new(1, 0, 0, maxH) })
+		end
+
+		for i, spec in ipairs(specs) do
+			local d = { options = spec.options, selected = spec.initial or spec.options[1], open = false, buttons = {} }
+			drops[i] = d
+			d.frame = new("Frame", {
+				BackgroundTransparency = 1,
+				ClipsDescendants = true,
+				Position = UDim2.new((i - 1) / count, i > 1 and 3 or 0, 0, 0),
+				Size = UDim2.new(1 / count, count > 1 and -3 or 0, 0, HEAD),
+			}, row)
+			local head = new("TextButton", {
+				Text = "",
+				AutoButtonColor = false,
+				Size = UDim2.new(1, 0, 0, HEAD),
+				BackgroundColor3 = theme.surface,
+				BackgroundTransparency = 0.35,
+				BorderSizePixel = 0,
+			}, d.frame)
+			corner(head, 8)
+			stroke(head, 0.94)
+			d.text = new("TextLabel", {
+				RichText = true,
+				Text = "",
+				Font = Enum.Font.GothamMedium,
+				TextSize = 12,
+				TextColor3 = theme.text,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(10, 0),
+				Size = UDim2.new(1, -28, 1, 0),
+			}, head)
+			d.arrow = new("TextLabel", {
+				Text = "v",
+				Font = Enum.Font.GothamBold,
+				TextSize = 11,
+				TextColor3 = theme.dim,
+				BackgroundTransparency = 1,
+				AnchorPoint = Vector2.new(1, 0.5),
+				Position = UDim2.new(1, -8, 0.5, 0),
+				Size = UDim2.fromOffset(14, 14),
+			}, head)
+
+			local function paint()
+				d.text.Text = '<font color="#9090a6">' .. spec.name .. "</font>  " .. escapeRich(d.selected)
+				for opt, b in pairs(d.buttons) do
+					b.TextColor3 = opt == d.selected and theme.accent or theme.text
+				end
+			end
+
+			for j, opt in ipairs(d.options) do
+				local b = new("TextButton", {
+					Text = opt,
+					Font = Enum.Font.GothamMedium,
+					TextSize = 12,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					AutoButtonColor = false,
+					BackgroundColor3 = theme.surface,
+					BackgroundTransparency = 0.35,
+					BorderSizePixel = 0,
+					Position = UDim2.fromOffset(0, HEAD + GAP + (j - 1) * (OPT + GAP)),
+					Size = UDim2.new(1, 0, 0, OPT),
+				}, d.frame)
+				corner(b, 8)
+				new("UIPadding", { PaddingLeft = UDim.new(0, 10) }, b)
+				d.buttons[opt] = b
+				connect(b.Activated, function()
+					d.open = false
+					local changed = d.selected ~= opt
+					d.selected = opt
+					paint()
+					relayout()
+					if changed and spec.onChange then
+						spec.onChange(opt)
+					end
+				end)
+			end
+			paint()
+
+			connect(head.Activated, function()
+				d.open = not d.open
+				for _, other in ipairs(drops) do
+					if other ~= d then
+						other.open = false
+					end
+				end
+				relayout()
+			end)
+		end
+		return row
+	end
+
+	function FS.textRow(placeholder, text, onSubmit)
+		local row = mainTab:Container(32)
+		local box = new("TextBox", {
+			Text = text or "",
+			PlaceholderText = placeholder,
+			PlaceholderColor3 = theme.dim,
+			ClearTextOnFocus = false,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			BackgroundColor3 = theme.surface,
+			BackgroundTransparency = 0.35,
+			BorderSizePixel = 0,
+			Size = UDim2.fromScale(1, 1),
+		}, row)
+		corner(box, 8)
+		stroke(box, 0.94)
+		new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, box)
+		connect(box.FocusLost, function()
+			onSubmit(FS.trim(box.Text))
+		end)
+		return row, box
+	end
+
+	FS.rowA = FS.dropRow({
+		{
+			name = "Provider",
+			options = { "ScriptBlox", "Rscripts" },
+			initial = provider,
+			onChange = function(v)
+				provider = v
+				updateFilterRows()
+				doSearch()
+			end,
+		},
+		{
+			name = "Game",
+			options = { "Any game", "This game", "Custom" },
+			initial = FS.gameMode,
+			onChange = function(v)
+				FS.gameMode = v
+				updateFilterRows()
+				doSearch()
+			end,
+		},
+	})
+	FS.rowB = FS.dropRow({
+		{
+			name = "Verified",
+			options = { "Any", "Verified only" },
+			onChange = function(v)
+				FS.verified = v == "Verified only"
+				doSearch()
+			end,
+		},
+		{
+			name = "Keys",
+			options = { "Any", "Keyless only" },
+			onChange = function(v)
+				FS.keyless = v == "Keyless only"
+				doSearch()
+			end,
+		},
+	})
+	FS.gameRow, FS.gameBox = FS.textRow("Game name or place ID", "", function()
+		doSearch()
+	end)
+	FS.keyRow = FS.textRow("Rscripts API key (rsc_live_...)", RS.key, function(text)
+		if text == RS.key then
+			return
+		end
+		RS.key = text
+		pcall(function()
+			if typeof(writefile) == "function" then
+				if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(SAVE_FOLDER) then
+					makefolder(SAVE_FOLDER)
+				end
+				writefile(RS.keyFile, text)
+			end
+		end)
+		if provider == "Rscripts" then
+			doSearch()
+		end
+	end)
+
+	updateFilterRows = function()
+		local scriptsMode = mode == "Scripts"
+		FS.rowA.Visible = scriptsMode
+		FS.rowB.Visible = scriptsMode
+		FS.gameRow.Visible = scriptsMode and FS.gameMode == "Custom"
+		FS.keyRow.Visible = scriptsMode and provider == "Rscripts"
+	end
+	updateFilterRows()
 
 	-----------------------------------------------------------------
 	-- Search bar
@@ -4864,6 +5346,9 @@ do
 			if item.patched then
 				table.insert(tags, '<font color="#eb5757">Patched</font>')
 			end
+			if item.risk and item.risk >= 6 then
+				table.insert(tags, '<font color="#eb5757">Risk ' .. item.risk .. "/10</font>")
+			end
 			table.insert(tags, shortNumber(item.views) .. " views")
 			local where = item.universal and "Universal" or (item.game or "Unknown game")
 
@@ -4956,7 +5441,8 @@ do
 		local currentMode = mode
 
 		sectionLabel.Text = string.upper(
-			searching and ('Results for "' .. query .. '"') or ("Trending " .. string.lower(currentMode))
+			(searching and ('Results for "' .. query .. '"') or ("Trending " .. string.lower(currentMode)))
+				.. (currentMode == "Scripts" and (" - " .. provider) or "")
 		)
 		clearResults()
 		showMessage("Loading...")
@@ -4964,10 +5450,11 @@ do
 		task.spawn(function()
 			local ok, items, err = pcall(function()
 				if currentMode == "Scripts" then
-					if searching then
-						return searchScripts(query)
+					local flt, filterErr = FS.collect()
+					if not flt then
+						return nil, filterErr
 					end
-					return trendingScripts()
+					return FS.fetch(searching and query or nil, flt)
 				end
 				if searching then
 					return searchGames(query)
@@ -4994,7 +5481,7 @@ do
 		end)
 	end
 
-	local function doSearch()
+	function doSearch()
 		local q = (searchBox.Text or ""):match("^%s*(.-)%s*$")
 		load(q ~= "" and q or nil)
 	end
@@ -6081,6 +6568,13 @@ settingsTab:InfoRow("Game ID", tostring(game.GameId), copyValue)
 settingsTab:InfoRow("Place ID", tostring(game.PlaceId), copyValue)
 settingsTab:InfoRow("Job ID", game.JobId ~= "" and game.JobId or "N/A", copyValue)
 settingsTab:Label("Tap a row to copy its value. Tap UNC test or sUNC test to run that test.")
+
+settingsTab:Section("Credits")
+local watermark = settingsTab:Label("Script by redxs/mochii/tcyfxyfx8")
+watermark.Font = Enum.Font.GothamBold
+watermark.TextSize = 13
+watermark.TextColor3 = theme.accent
+watermark.TextXAlignment = Enum.TextXAlignment.Center
 
 task.spawn(function()
 	while gui.Parent do

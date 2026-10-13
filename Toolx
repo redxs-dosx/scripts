@@ -419,6 +419,42 @@ local dot = new("Frame", {
 }, titleBar)
 corner(dot, 4)
 
+-- Logo (downloaded once, falls back to the dot if the executor can't do it)
+local LOGO_URL = "https://raw.githubusercontent.com/redxs-dosx/scripts/cf91929ea86af4df0e974cdfbfbf9192b9fdf8ec/logo.png"
+local logo = new("ImageLabel", {
+	Name = "Logo",
+	Size = UDim2.fromOffset(24, 24),
+	Position = UDim2.new(0, 10, 0.5, -12),
+	BackgroundTransparency = 1,
+	ScaleType = Enum.ScaleType.Fit,
+	Visible = false,
+}, titleBar)
+task.spawn(function()
+	local ok, err = pcall(function()
+		local getAsset = getcustomasset or getsynasset
+		if not (getAsset and writefile and game.HttpGet) then
+			error("executor lacks getcustomasset/writefile/HttpGet")
+		end
+		local data = game:HttpGet(LOGO_URL)
+		if typeof(data) ~= "string" or #data == 0 then
+			error("empty download")
+		end
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Toolx") then
+				makefolder("Toolx")
+			end
+		end)
+		local path = "Toolx/logo.png"
+		writefile(path, data)
+		logo.Image = getAsset(path)
+		logo.Visible = true
+		dot.Visible = false
+	end)
+	if not ok then
+		warn("[Toolx] logo failed to load: " .. tostring(err))
+	end
+end)
+
 new("TextLabel", {
 	Text = 'Toolx  <font size="11" color="#9090a6">v' .. VERSION .. "</font>",
 	RichText = true,
@@ -427,8 +463,8 @@ new("TextLabel", {
 	TextColor3 = theme.text,
 	TextXAlignment = Enum.TextXAlignment.Left,
 	BackgroundTransparency = 1,
-	Position = UDim2.new(0, 30, 0, 0),
-	Size = UDim2.new(1, -100, 1, 0),
+	Position = UDim2.new(0, 42, 0, 0),
+	Size = UDim2.new(1, -112, 1, 0),
 }, titleBar)
 
 local function headerButton(text, xOffset, hoverColor)

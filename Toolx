@@ -935,7 +935,7 @@ local function addTab(name)
 	end
 
 	-- A row that drops open to a short list. Tap it, pick an option and that option turns on (only one at a time).
-	-- Tap the row again to turn it off. The list closes when you scroll or tap anywhere else.
+	-- Tap the row again to turn it off. The list closes when you scroll or switch tabs.
 	-- callback(optionName or nil) fires whenever it changes; Set(name or nil) / Get() control it from code.
 	function api:DropToggle(text, options, callback)
 		local HEAD, OPT, GAP = 38, 30, 4
@@ -1074,25 +1074,7 @@ local function addTab(name)
 			end
 		end)
 
-		-- close when the person taps anywhere that isn't this dropdown
-		connect(UserInputService.InputBegan, function(input)
-			if not open then
-				return
-			end
-			local t = input.UserInputType
-			if t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch then
-				return
-			end
-			local p = Vector2.new(input.Position.X, input.Position.Y)
-			if gui.IgnoreGuiInset then
-				p = p + game:GetService("GuiService"):GetGuiInset()
-			end
-			local pos, size = wrap.AbsolutePosition, wrap.AbsoluteSize
-			if p.X < pos.X or p.X > pos.X + size.X or p.Y < pos.Y or p.Y > pos.Y + size.Y then
-				setOpen(false)
-			end
-		end)
-		-- ...or when the page is scrolled / the tab is switched away
+		-- close when the page is scrolled or the tab is switched away
 		connect(scroller:GetPropertyChangedSignal("CanvasPosition"), function()
 			if open and os.clock() > suppressUntil then
 				setOpen(false)

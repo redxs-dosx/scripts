@@ -140,6 +140,12 @@ local function saveOptions()
 		return
 	end
 	local options = {}
+	-- options that aren't on screen right now (a module of another game) stay on disk
+	for key, value in pairs(savedData.options) do
+		if registry[key] == nil then
+			options[key] = value
+		end
+	end
 	for key, comp in pairs(registry) do
 		options[key] = comp.Get()
 	end
@@ -608,6 +614,44 @@ local function selectTab(tab)
 	tween(tab.page, 0.35, { GroupTransparency = 0, Position = UDim2.fromOffset(0, 0) })
 end
 
+-- Lays the sidebar buttons out again so hidden tabs leave no gap
+local function relayoutTabs()
+	local y = 10
+	for _, t in ipairs(tabs) do
+		if t.hidden then
+			t.button.Visible = false
+		else
+			t.button.Visible = true
+			t.y = y
+			t.button.Position = UDim2.new(0, 8, 0, y)
+			y += 36
+		end
+	end
+	sidebarScroll.CanvasSize = UDim2.fromOffset(0, y + 6)
+	if currentTab and not currentTab.hidden then
+		tween(indicator, 0.25, { Position = UDim2.new(0, 8, 0, currentTab.y) })
+	end
+end
+
+local function setTabHidden(tab, hidden)
+	hidden = hidden == true
+	if tab.hidden == hidden then
+		return
+	end
+	tab.hidden = hidden
+	if hidden and currentTab == tab and tabs[1] and tabs[1] ~= tab then
+		selectTab(tabs[1])
+	end
+	relayoutTabs()
+end
+
+local function setTabName(tab, name)
+	tab.name = name
+	tab.button.Text = name
+	tab.button.TextTruncate = Enum.TextTruncate.AtEnd
+	tab.page.Name = name
+end
+
 local function addTab(name)
 	local index = #tabs + 1
 	local y = 10 + (index - 1) * 36
@@ -657,8 +701,9 @@ local function addTab(name)
 		SortOrder = Enum.SortOrder.LayoutOrder,
 	}, scroller)
 
-	local tab = { name = name, y = y, button = button, page = page }
+	local tab = { name = name, y = y, button = button, page = page, hidden = false }
 	table.insert(tabs, tab)
+	relayoutTabs()
 
 	connect(button.MouseEnter, function()
 		if currentTab ~= tab then
@@ -4725,6 +4770,387 @@ do
 end
 
 ---------------------------------------------------------------------
+-- Modules repo (officially supported games)
+-- Every file in the repo starts with:  local GameId = <game id>
+---------------------------------------------------------------------
+local Modules = {
+	owner = "redxs-dosx",
+	repo = "modules",
+	branch = "main",
+	items = nil, -- { { path, title, ids, source, rawUrl } }
+	info = {}, -- game id -> { id, placeId, universeId, name, players }
+	known = {}, -- ids (module ids + resolved place / universe ids) that count as supported
+	loading = false,
+	resolving = false,
+	startupDone = false, -- set once Toolx has finished starting
+}
+function Modules.Unload() end -- replaced by the Module tab below
+
+-- Options created after startup (a module building its UI) still get their saved value back
+setmetatable(registry, {
+	__newindex = function(t, key, comp)
+		rawset(t, key, comp)
+		if not (Modules.startupDone and keepEnabled and typeof(key) == "string" and typeof(comp) == "table" and comp.Get and comp.Set) then
+			return
+		end
+		local value = savedData.options[key]
+		if value ~= nil and typeof(value) == typeof(comp.Get()) then
+			task.defer(function()
+				local was = loadingOptions
+				loadingOptions = true
+				pcall(comp.Set, value)
+				loadingOptions = was
+			end)
+		end
+	end,
+})
+do
+	local function getJson(url)
+		local body = fetchUrl(url)
+		if not body then
+			return nil
+		end
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+		return (ok and typeof(data) == "table") and data or nil
+	end
+
+	-- Only the first line counts
+	function Modules.parseHeader(body)
+		body = body:gsub("^\239\187\191", "") -- strip a UTF-8 BOM
+		local first = body:match("^[^\r\n]*") or ""
+		first = first:gsub("%-%-.*$", "")
+		local name, value = first:match("^%s*local%s+([%w_]+)%s*=%s*(.-)%s*;?%s*$")
+		if not name or name:lower() ~= "gameid" then
+			return nil
+		end
+		local ids = {}
+		for id in value:gmatch("%d+") do
+			table.insert(ids, id)
+		end
+		return #ids > 0 and ids or nil
+	end
+
+	function Modules.rebuildKnown()
+		local known = {}
+		for _, item in ipairs(Modules.items or {}) do
+			for _, id in ipairs(item.ids) do
+				known[id] = true
+			end
+		end
+		for _, info in pairs(Modules.info) do
+			if info.placeId then
+				known[tostring(info.placeId)] = true
+			end
+			if info.universeId then
+				known[tostring(info.universeId)] = true
+			end
+		end
+		Modules.known = known
+	end
+
+	-- One tree call lists the repo, then the files are downloaded a few at a time
+	function Modules.build()
+		local base = "https://raw.githubusercontent.com/" .. Modules.owner .. "/" .. Modules.repo .. "/" .. Modules.branch .. "/"
+		local data = getJson("https://api.github.com/repos/" .. Modules.owner .. "/" .. Modules.repo .. "/git/trees/" .. Modules.branch .. "?recursive=1")
+		if not data or typeof(data.tree) ~= "table" then
+			return nil, "Couldn't read the modules repo. GitHub may be rate limiting you, try again in a while."
+		end
+		local files = {}
+		for _, node in ipairs(data.tree) do
+			if typeof(node) == "table" and node.type == "blob" and typeof(node.path) == "string" and node.path:lower():match("%.luau?$") then
+				table.insert(files, node.path)
+			end
+		end
+
+		local results, cursor, active = {}, 0, 0
+		local function worker()
+			while true do
+				cursor += 1
+				local i = cursor
+				local path = files[i]
+				if not path then
+					break
+				end
+				local encoded = (path:gsub("[^/]+", function(seg)
+					return HttpService:UrlEncode(seg)
+				end))
+				local url = base .. encoded
+				local body = fetchUrl(url)
+				local ids = body and Modules.parseHeader(body)
+				if ids then
+					local file = path:match("([^/]+)$") or path
+					results[i] = { path = path, title = (file:gsub("%.luau?$", "")), ids = ids, source = body, rawUrl = url }
+				end
+			end
+			active -= 1
+		end
+		for _ = 1, math.min(8, #files) do
+			active += 1
+			task.spawn(worker)
+		end
+		local waited = 0
+		while active > 0 and waited < 60 do
+			task.wait(0.1)
+			waited += 0.1
+		end
+
+		local items = {}
+		for i = 1, #files do
+			if results[i] then
+				table.insert(items, results[i])
+			end
+		end
+		return items
+	end
+
+	-- Loaded once per session; Load(true) pulls the repo again
+	function Modules.Load(force)
+		if force and not Modules.loading then
+			-- pull the repo again, but keep the old data if that fails
+			Modules.loading = true
+			local ok, items, err = pcall(Modules.build)
+			Modules.loading = false
+			if ok and items then
+				Modules.items = items
+				Modules.info = {}
+				Modules.rebuildKnown()
+				return items
+			end
+			return Modules.items, (ok and err) or "Couldn't read the modules repo."
+		end
+		if Modules.items then
+			return Modules.items
+		end
+		if Modules.loading then
+			local waited = 0
+			while Modules.loading and waited < 70 do
+				task.wait(0.2)
+				waited += 0.2
+			end
+			if Modules.items then
+				return Modules.items
+			end
+			return nil, "The modules repo didn't finish loading."
+		end
+		Modules.loading = true
+		local ok, items, err = pcall(Modules.build)
+		Modules.loading = false
+		if not ok then
+			return nil, "Couldn't read the modules repo."
+		end
+		if items then
+			Modules.items = items
+			Modules.rebuildKnown()
+		end
+		return items, err
+	end
+
+	-- A module's id can be a place id or a universe id, so work out both plus the game's name
+	local function resolveOne(id)
+		local info = { id = id }
+		local universe
+		local d = getJson("https://apis.roblox.com/universes/v1/places/" .. id .. "/universe")
+		if d and d.universeId then
+			universe = tostring(d.universeId)
+			info.placeId = id
+		else
+			universe = id
+		end
+		local g = getJson("https://games.roblox.com/v1/games?universeIds=" .. universe)
+		local entry = g and typeof(g.data) == "table" and g.data[1]
+		if typeof(entry) == "table" then
+			info.name = entry.name and tostring(entry.name) or nil
+			info.players = tonumber(entry.playing) or 0
+			info.universeId = tostring(entry.id or universe)
+			info.placeId = info.placeId or (entry.rootPlaceId and tostring(entry.rootPlaceId)) or nil
+		elseif info.placeId then
+			info.universeId = universe
+			pcall(function()
+				info.name = game:GetService("MarketplaceService"):GetProductInfo(tonumber(id)).Name
+			end)
+		end
+		return info
+	end
+
+	function Modules.Resolve()
+		local items = Modules.Load()
+		if not items then
+			return false
+		end
+		if Modules.resolving then
+			local waited = 0
+			while Modules.resolving and waited < 70 do
+				task.wait(0.2)
+				waited += 0.2
+			end
+			return true
+		end
+		local todo, seen = {}, {}
+		for _, item in ipairs(items) do
+			for _, id in ipairs(item.ids) do
+				if not Modules.info[id] and not seen[id] then
+					seen[id] = true
+					table.insert(todo, id)
+				end
+			end
+		end
+		if #todo == 0 then
+			return true
+		end
+		Modules.resolving = true
+		local cursor, active = 0, 0
+		local function worker()
+			while true do
+				cursor += 1
+				local id = todo[cursor]
+				if not id then
+					break
+				end
+				local ok, info = pcall(resolveOne, id)
+				Modules.info[id] = ok and info or { id = id }
+			end
+			active -= 1
+		end
+		for _ = 1, math.min(6, #todo) do
+			active += 1
+			task.spawn(worker)
+		end
+		local waited = 0
+		while active > 0 and waited < 60 do
+			task.wait(0.1)
+			waited += 0.1
+		end
+		Modules.resolving = false
+		Modules.rebuildKnown()
+		return true
+	end
+
+	-- One entry per supported game, each with the modules that belong to it
+	function Modules.Games()
+		local items, err = Modules.Load()
+		if not items then
+			return nil, err
+		end
+		Modules.Resolve()
+		local byKey, list = {}, {}
+		for _, item in ipairs(items) do
+			for _, id in ipairs(item.ids) do
+				local info = Modules.info[id] or {}
+				local key = info.universeId or id
+				local g = byKey[key]
+				if not g then
+					g = {
+						id = id,
+						universeId = info.universeId,
+						placeId = info.placeId or id,
+						name = info.name or ("Game " .. id),
+						players = info.players or 0,
+						modules = {},
+					}
+					byKey[key] = g
+					table.insert(list, g)
+				end
+				local dupe = false
+				for _, m in ipairs(g.modules) do
+					if m == item then
+						dupe = true
+					end
+				end
+				if not dupe then
+					table.insert(g.modules, item)
+				end
+			end
+		end
+		table.sort(list, function(a, b)
+			return a.name:lower() < b.name:lower()
+		end)
+		return list
+	end
+
+	-- Modules that belong to the game you're in right now
+	function Modules.ForCurrentGame()
+		local out = {}
+		local place, uni = tostring(game.PlaceId), tostring(game.GameId)
+		for _, item in ipairs(Modules.items or {}) do
+			for _, id in ipairs(item.ids) do
+				local info = Modules.info[id]
+				if id == place or id == uni or (info and (info.universeId == uni or info.placeId == place)) then
+					table.insert(out, item)
+					break
+				end
+			end
+		end
+		return out
+	end
+
+	function Modules.CurrentName()
+		local place, uni = tostring(game.PlaceId), tostring(game.GameId)
+		for _, item in ipairs(Modules.ForCurrentGame()) do
+			for _, id in ipairs(item.ids) do
+				local info = Modules.info[id]
+				if info and info.name and (id == place or id == uni or info.universeId == uni or info.placeId == place) then
+					return info.name
+				end
+			end
+		end
+		return (game.Name and game.Name ~= "" and game.Name) or "Module"
+	end
+
+	function Modules.IsSupported(universeId, placeId)
+		return Modules.known[tostring(universeId)] == true or Modules.known[tostring(placeId)] == true
+	end
+
+	-- Games in Roblox's own lists, supported ones first (keeps the original order inside each group)
+	function Modules.SortSupported(list)
+		local first, rest = {}, {}
+		for _, g in ipairs(list) do
+			if Modules.IsSupported(g.universeId, g.placeId) then
+				g.supported = true
+				table.insert(first, g)
+			else
+				table.insert(rest, g)
+			end
+		end
+		for _, g in ipairs(rest) do
+			table.insert(first, g)
+		end
+		return first
+	end
+
+	-- Every supported game, shaped like a Roblox list entry so the Main tab can draw it
+	function Modules.SupportedGames(query)
+		local games, err = Modules.Games()
+		if not games then
+			return nil, err
+		end
+		local q = (query or ""):lower()
+		local out = {}
+		for _, g in ipairs(games) do
+			if q == "" or g.name:lower():find(q, 1, true) then
+				table.insert(out, {
+					universeId = g.universeId,
+					placeId = tonumber(g.placeId) or g.placeId,
+					name = g.name,
+					players = g.players,
+					up = 0,
+					down = 0,
+					supported = true,
+				})
+			end
+		end
+		if #out == 0 then
+			if q ~= "" then
+				return nil, 'No supported games match "' .. query .. '".'
+			end
+			return nil, "No supported games yet."
+		end
+		return out
+	end
+end
+
+---------------------------------------------------------------------
 -- Main tab (profile header, trending scripts / games, search)
 ---------------------------------------------------------------------
 local mainTab = addTab("Main")
@@ -4740,7 +5166,7 @@ do
 	local requestId = 0
 	local provider = "ScriptBlox" -- "ScriptBlox", "Rscripts" or "xScripts"
 	local RS = { api = "https://api.rscripts.net/v1/", key = "", keyFile = SAVE_FOLDER .. "/rscripts.key" }
-	local FS = { verified = false, keyless = false, gameMode = "Any game" } -- filter state + helpers
+	local FS = { verified = false, keyless = false, gameMode = "Any game", sort = "Default" } -- filter state + helpers
 	local updateFilterRows -- forward declarations, defined below
 	local doSearch
 
@@ -5773,6 +6199,18 @@ do
 			end,
 		},
 	})
+	-- Games mode only: sort / filter by the games that have an official module
+	FS.rowC = FS.dropRow({
+		{
+			name = "Sort",
+			options = { "Default", "Supported first", "Supported only" },
+			initial = FS.sort,
+			onChange = function(v)
+				FS.sort = v
+				doSearch()
+			end,
+		},
+	})
 	FS.gameRow, FS.gameBox = FS.textRow("Game name or place ID", "", function()
 		doSearch()
 	end)
@@ -5798,6 +6236,7 @@ do
 		local scriptsMode = mode == "Scripts"
 		FS.rowA.Visible = scriptsMode
 		FS.rowB.Visible = scriptsMode
+		FS.rowC.Visible = not scriptsMode
 		FS.gameRow.Visible = scriptsMode and FS.gameMode == "Custom"
 		FS.keyRow.Visible = scriptsMode and provider == "Rscripts"
 	end
@@ -6067,7 +6506,9 @@ do
 			local total = (g.up or 0) + (g.down or 0)
 			local liked = total > 0 and (math.floor(g.up / total * 100 + 0.5) .. "% liked") or "No votes"
 			new("TextLabel", {
-				Text = shortNumber(g.players) .. " playing  ·  " .. liked,
+				RichText = true,
+				Text = shortNumber(g.players) .. " playing  ·  " .. liked
+					.. ((g.supported or Modules.IsSupported(g.universeId, g.placeId)) and '  ·  <font color="#4cc978">Supported</font>' or ""),
 				Font = Enum.Font.Gotham,
 				TextSize = 11,
 				TextColor3 = theme.dim,
@@ -6105,6 +6546,9 @@ do
 			(searching and ('Results for "' .. query .. '"') or ((currentMode == "Scripts" and provider == "xScripts") and "All scripts" or ("Trending " .. string.lower(currentMode))))
 				.. (currentMode == "Scripts" and (" - " .. provider) or "")
 		)
+		if currentMode == "Games" and FS.sort == "Supported only" and not searching then
+			sectionLabel.Text = "SUPPORTED GAMES"
+		end
 		clearResults()
 		showMessage("Loading...")
 
@@ -6117,10 +6561,21 @@ do
 					end
 					return FS.fetch(searching and query or nil, flt)
 				end
-				if searching then
-					return searchGames(query)
+				local sort = FS.sort
+				if sort == "Supported only" then
+					return Modules.SupportedGames(searching and query or nil)
 				end
-				return trendingGames()
+				local list, gamesErr
+				if searching then
+					list, gamesErr = searchGames(query)
+				else
+					list, gamesErr = trendingGames()
+				end
+				if list and sort == "Supported first" then
+					Modules.Load()
+					list = Modules.SortSupported(list)
+				end
+				return list, gamesErr
 			end)
 			if id ~= requestId or not gui.Parent then
 				return -- a newer request replaced this one
@@ -6155,6 +6610,305 @@ do
 	end)
 
 	load(nil)
+
+	-----------------------------------------------------------------
+	-- Games + Module tabs (officially supported games, from the modules repo)
+	-----------------------------------------------------------------
+	local gamesTab = addTab("Games")
+	local moduleTab = addTab("Module")
+	setTabHidden(moduleTab, true) -- only shown when the current game has a module
+
+	-- Same look as the Main tab's result cards
+	local function makeList(tab)
+		local box = tab:Container()
+		new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, box)
+		local list = { order = 0 }
+		function list.clear()
+			list.order = 0
+			for _, c in ipairs(box:GetChildren()) do
+				if not c:IsA("UIListLayout") then
+					c:Destroy()
+				end
+			end
+		end
+		function list.message(text)
+			list.order += 1
+			new("TextLabel", {
+				Text = text,
+				Font = Enum.Font.Gotham,
+				TextSize = 12,
+				TextColor3 = theme.dim,
+				TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Top,
+				BackgroundTransparency = 1,
+				AutomaticSize = Enum.AutomaticSize.Y,
+				Size = UDim2.new(1, 0, 0, 0),
+				LayoutOrder = list.order,
+			}, box)
+		end
+		function list.card(height)
+			list.order += 1
+			local c = new("Frame", {
+				Size = UDim2.new(1, 0, 0, height),
+				BackgroundColor3 = theme.surface,
+				BackgroundTransparency = 0.35,
+				BorderSizePixel = 0,
+				LayoutOrder = list.order,
+			}, box)
+			corner(c, 8)
+			stroke(c, 0.94)
+			return c
+		end
+		return list
+	end
+
+	local updateModuleTab -- forward declaration
+
+	-- Games tab -------------------------------------------------------
+	gamesTab:Section("Officially supported games")
+	gamesTab:Label("These games have their own module. Join one and a tab with its name shows up in the sidebar.")
+	local gamesList
+	local gamesToken = 0
+
+	local function renderSupported(games)
+		local here = { [tostring(game.PlaceId)] = true, [tostring(game.GameId)] = true }
+		for _, g in ipairs(games) do
+			local c = gamesList.card(54)
+			local icon = new("ImageLabel", {
+				Position = UDim2.fromOffset(8, 8),
+				Size = UDim2.fromOffset(38, 38),
+				BackgroundColor3 = theme.off,
+				BorderSizePixel = 0,
+				Image = g.universeId and ("rbxthumb://type=GameIcon&id=" .. tostring(g.universeId) .. "&w=150&h=150") or "",
+				ScaleType = Enum.ScaleType.Crop,
+			}, c)
+			corner(icon, 8)
+
+			new("TextLabel", {
+				Text = g.name,
+				Font = Enum.Font.GothamBold,
+				TextSize = 12,
+				TextColor3 = theme.text,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(54, 8),
+				Size = UDim2.new(1, -112, 0, 18),
+			}, c)
+
+			local isHere = here[tostring(g.placeId)] or (g.universeId and here[tostring(g.universeId)]) or false
+			local count = #g.modules
+			new("TextLabel", {
+				RichText = true,
+				Text = shortNumber(g.players) .. " playing  ·  " .. count .. (count == 1 and " module" or " modules")
+					.. (isHere and '  ·  <font color="#4cc978">You\'re here</font>' or ""),
+				Font = Enum.Font.Gotham,
+				TextSize = 11,
+				TextColor3 = theme.dim,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(54, 27),
+				Size = UDim2.new(1, -112, 0, 16),
+			}, c)
+
+			local joinBtn = cardButton(c, isHere and "Here" or "Join", isHere and theme.off or theme.accent, UDim2.new(1, -54, 0.5, -13), UDim2.fromOffset(46, 26))
+			if not isHere then
+				joinBtn.Activated:Connect(function()
+					say(joinBtn, "Join", "...", 2)
+					notify("Joining " .. g.name, "info")
+					local ok = pcall(function()
+						TeleportService:Teleport(tonumber(g.placeId), player)
+					end)
+					if not ok then
+						say(joinBtn, "Join", "Failed", 1.4)
+					end
+				end)
+			end
+		end
+	end
+
+	local function loadGames(force)
+		gamesToken += 1
+		local token = gamesToken
+		gamesList.clear()
+		gamesList.message("Loading supported games...")
+		task.spawn(function()
+			if force then
+				pcall(Modules.Load, true)
+			end
+			local ok, games, err = pcall(Modules.Games)
+			if token ~= gamesToken or not gui.Parent then
+				return
+			end
+			gamesList.clear()
+			if not ok then
+				gamesList.message("Something went wrong while loading. Tap Refresh to try again.")
+			elseif not games or #games == 0 then
+				gamesList.message((err or "No supported games yet.") .. " Tap Refresh to try again.")
+			else
+				renderSupported(games)
+			end
+			updateModuleTab()
+		end)
+	end
+
+	gamesTab:Button("Refresh", function()
+		loadGames(true)
+	end)
+	gamesList = makeList(gamesTab)
+
+	-- Module tab ------------------------------------------------------
+	-- Every module for this game is run as  fn(Tab, Toolx, info)  and builds its UI straight into this tab.
+	local moduleHeader = moduleTab:Section("Module")
+	local moduleNote = moduleTab:Label("")
+	local reloadModule -- forward declaration
+	moduleTab:Button("Reload module", function()
+		reloadModule()
+	end)
+
+	local moduleScroller = moduleTab.page:FindFirstChildOfClass("ScrollingFrame")
+	local moduleBase = {} -- everything in the tab before a module ran, so a reload can clear the rest
+	for _, c in ipairs(moduleScroller:GetChildren()) do
+		moduleBase[c] = true
+	end
+	local moduleUnloaders = {}
+	local baseKeys -- option keys that existed before the module ran
+	local moduleRun = 0
+	local lastModuleKey
+
+	-- Tab:OnUnload(fn) lets a module stop its loops / connections when it is reloaded or Toolx closes
+	function moduleTab.OnUnload(_, fn)
+		if typeof(fn) == "function" then
+			table.insert(moduleUnloaders, fn)
+		end
+	end
+
+	local function unloadModule()
+		moduleRun += 1
+		for i = #moduleUnloaders, 1, -1 do
+			pcall(moduleUnloaders[i])
+		end
+		table.clear(moduleUnloaders)
+		for _, c in ipairs(moduleScroller:GetChildren()) do
+			if not moduleBase[c] then
+				c:Destroy()
+			end
+		end
+		if baseKeys then
+			-- remember the module's option values so they come back next time
+			for key, comp in pairs(registry) do
+				if not baseKeys[key] then
+					pcall(function()
+						savedData.options[key] = comp.Get()
+					end)
+					registry[key] = nil
+				end
+			end
+			baseKeys = nil
+		end
+	end
+	Modules.Unload = unloadModule
+
+	local function showModuleError(item, text)
+		warn("[Toolx] module " .. item.title .. ": " .. text)
+		notify("Module " .. item.title .. " failed (see console)", "error")
+		moduleTab:Label("Module " .. item.title .. " failed: " .. text)
+	end
+
+	local function loadModule(items)
+		unloadModule()
+		local run = moduleRun
+		baseKeys = {}
+		for key in pairs(registry) do
+			baseKeys[key] = true
+		end
+		task.spawn(function()
+			local waited = 0
+			while not Toolx and waited < 10 do
+				task.wait(0.1)
+				waited += 0.1
+			end
+			for _, item in ipairs(items) do
+				if run ~= moduleRun or not gui.Parent then
+					return
+				end
+				if typeof(loadstring) ~= "function" then
+					moduleTab:Label("Your executor can't run modules (no loadstring).")
+					return
+				end
+				LoadLogger.ignore = true -- modules aren't logged, same as scripts run from the browser
+				local fn, err = loadstring(item.source)
+				LoadLogger.ignore = false
+				if not fn then
+					showModuleError(item, tostring(err))
+				else
+					local ok, runErr = pcall(fn, moduleTab, Toolx, {
+						title = item.title,
+						path = item.path,
+						gameId = tostring(game.GameId),
+						placeId = tostring(game.PlaceId),
+					})
+					if not ok and run == moduleRun then
+						showModuleError(item, tostring(runErr))
+					end
+				end
+			end
+		end)
+	end
+
+	-- Shows the Module tab (named after the game) and builds the module(s) when this game has one,
+	-- hides the tab otherwise
+	function updateModuleTab(force)
+		local items = Modules.ForCurrentGame()
+		if #items == 0 then
+			if lastModuleKey then
+				unloadModule()
+			end
+			lastModuleKey = nil
+			setTabHidden(moduleTab, true)
+			return
+		end
+		local name = Modules.CurrentName()
+		setTabName(moduleTab, name)
+		moduleHeader.Text = string.upper(name)
+		local key = ""
+		for _, item in ipairs(items) do
+			key ..= item.path .. "|"
+		end
+		if force or key ~= lastModuleKey then
+			lastModuleKey = key
+			moduleNote.Text = "Official module" .. (#items == 1 and "" or "s") .. " for this game, loaded from the modules repo."
+			loadModule(items)
+		end
+		setTabHidden(moduleTab, false)
+	end
+
+	function reloadModule()
+		task.spawn(function()
+			local _, err = Modules.Load(true)
+			pcall(Modules.Resolve)
+			if not gui.Parent then
+				return
+			end
+			updateModuleTab(true)
+			if err then
+				notify("Couldn't re-download, reloaded the saved copy", "warn")
+			else
+				notify("Module reloaded", "success")
+			end
+		end)
+	end
+
+	-- Check the repo in the background as soon as Toolx opens
+	task.spawn(function()
+		pcall(Modules.Load)
+		if gui.Parent then
+			updateModuleTab() -- ids that match this game directly show up straight away
+		end
+	end)
+	loadGames(false)
 end
 
 ---------------------------------------------------------------------
@@ -7926,6 +8680,7 @@ function Toolx.Close()
 	closing = true
 	animId += 1
 
+	pcall(Modules.Unload) -- stops the module and keeps its option values
 	pcall(saveOptions) -- flush anything still waiting to be written
 	pcall(Desync.Unload)
 	pcall(Mods.Unload)
@@ -8052,6 +8807,7 @@ if keepEnabled then
 	end
 end
 
+Modules.startupDone = true
 selectTab(mainTab)
 tween(main, 0.4, { GroupTransparency = 0 })
 tween(mainScale, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)

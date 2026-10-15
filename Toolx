@@ -1574,6 +1574,55 @@ local function addTab(name)
 		return comp
 	end
 
+	-- Free text input row. Returns { Get, Set, Box }; callback(text, enterPressed) fires when the box loses focus.
+	function api:TextInput(text, placeholder, callback)
+		local r = row(40)
+		new("TextLabel", {
+			Text = text,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 13,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 0),
+			Size = UDim2.new(0.34, -12, 1, 0),
+		}, r)
+		local box = new("TextBox", {
+			Text = "",
+			PlaceholderText = placeholder or "",
+			PlaceholderColor3 = theme.dim,
+			ClearTextOnFocus = false,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			BackgroundColor3 = theme.bg,
+			BackgroundTransparency = 0.3,
+			BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			Size = UDim2.new(0.66, -20, 0, 26),
+		}, r)
+		corner(box, 6)
+		stroke(box, 0.9)
+		new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, box)
+		if callback then
+			connect(box.FocusLost, function(enter)
+				callback(box.Text, enter)
+			end)
+		end
+		return {
+			Box = box,
+			Get = function()
+				return box.Text
+			end,
+			Set = function(v)
+				box.Text = tostring(v)
+			end,
+		}
+	end
+
 	-- Empty frame placed in the page's list. With a height it is fixed; without one it grows to fit its children.
 	function api:Container(height)
 		local f = new("Frame", {
@@ -2292,6 +2341,15 @@ do
 			root.AssemblyAngularVelocity = Vector3.zero
 		end
 		return true
+	end
+
+	-- Teleports you to a world position (keeps the way you are facing)
+	function Teleport.ToPosition(pos)
+		local root = getRoot(player.Character)
+		if not root then
+			return false
+		end
+		return moveTo(CFrame.new(pos) * (root.CFrame - root.CFrame.Position))
 	end
 
 	-- Teleports you just behind the other player
@@ -6429,6 +6487,428 @@ worldTab:Button("Teleport to spawn", function()
 end)
 worldTab:Label("Tap a player, then Teleport (next to them), Fling (you return to your spot afterwards) or Take tools (copies their tools to your backpack; usually only the tool they have equipped is visible to you). Tap Teleport to spawn again to cycle through spawns.")
 
+---------------------------------------------------------------------
+-- Coordinates: live position, teleport to coordinates, preset / auto / custom maps
+---------------------------------------------------------------------
+local positionText, worldPosRow, settingsPosRow
+do
+	-- Built-in presets. Add a game by PlaceId or GameId (Settings > Info shows both):
+	-- { name = "Game", ids = { 1234567890 }, maps = { { name = "Map", locs = { { "Spot", x, y, z } } } } }
+	local GAME_PRESETS = {}
+
+	local MAPS_FILE = SAVE_FOLDER .. "/maps.json"
+	local gameKey = game.GameId
+	local customMaps = {} -- every custom map on disk, all games: { name, gameId, locs = { { name, x, y, z } } }
+	local autoMaps = {} -- found by scanning this server: Spawns, Landmarks
+
+	local function getRoot()
+		local char = player.Character
+		return char and char:FindFirstChild("HumanoidRootPart")
+	end
+
+	function positionText()
+		local root = getRoot()
+		if not root then
+			return "N/A"
+		end
+		local p = root.Position
+		return string.format("%.1f, %.1f, %.1f", p.X, p.Y, p.Z)
+	end
+
+	-- Read the first three numbers out of text like "10, 50.5, -300" or "(10 50 -300)"
+	local function parseCoords(text)
+		local nums = {}
+		for n in string.gmatch(text or "", "-?%d+%.?%d*") do
+			table.insert(nums, tonumber(n))
+		end
+		if #nums >= 3 and nums[1] and nums[2] and nums[3] then
+			return nums[1], nums[2], nums[3]
+		end
+		return nil
+	end
+
+	-- Custom maps are kept in their own file so they survive even when "Keep options" is off
+	if fileSystemAvailable() then
+		pcall(function()
+			if not isfile(MAPS_FILE) then
+				return
+			end
+			local data = HttpService:JSONDecode(readfile(MAPS_FILE))
+			if typeof(data) ~= "table" or typeof(data.maps) ~= "table" then
+				return
+			end
+			for _, m in ipairs(data.maps) do
+				if typeof(m) == "table" and typeof(m.name) == "string" and typeof(m.locs) == "table" then
+					local map = { name = m.name, gameId = tonumber(m.gameId) or 0, kind = "custom", locs = {} }
+					for _, l in ipairs(m.locs) do
+						if typeof(l) == "table" and typeof(l.name) == "string" and tonumber(l.x) and tonumber(l.y) and tonumber(l.z) then
+							table.insert(map.locs, { name = l.name, x = tonumber(l.x), y = tonumber(l.y), z = tonumber(l.z) })
+						end
+					end
+					table.insert(customMaps, map)
+				end
+			end
+		end)
+	end
+
+	local function saveMaps()
+		if not fileSystemAvailable() then
+			return false
+		end
+		local out = {}
+		for _, m in ipairs(customMaps) do
+			table.insert(out, { name = m.name, gameId = m.gameId, locs = m.locs })
+		end
+		pcall(function()
+			if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(SAVE_FOLDER) then
+				makefolder(SAVE_FOLDER)
+			end
+		end)
+		return (pcall(function()
+			writefile(MAPS_FILE, HttpService:JSONEncode({ maps = out }))
+		end))
+	end
+
+	-- Every map to show for this game: presets, then scanned, then your own
+	local function allMaps()
+		local list = {}
+		for _, g in ipairs(GAME_PRESETS) do
+			local match = false
+			for _, id in ipairs(g.ids or {}) do
+				if id == game.PlaceId or id == game.GameId then
+					match = true
+				end
+			end
+			if match then
+				for _, m in ipairs(g.maps or {}) do
+					local map = { name = m.name, kind = "preset", locs = {} }
+					for _, l in ipairs(m.locs or {}) do
+						table.insert(map.locs, { name = l[1], x = l[2], y = l[3], z = l[4] })
+					end
+					table.insert(list, map)
+				end
+			end
+		end
+		for _, m in ipairs(autoMaps) do
+			table.insert(list, m)
+		end
+		for _, m in ipairs(customMaps) do
+			if m.gameId == gameKey then
+				table.insert(list, m)
+			end
+		end
+		return list
+	end
+
+	-- Scan the workspace for spawn pads and big top-level models
+	local function scanWorld()
+		local spawns = { name = "Spawns (scanned)", kind = "auto", locs = {} }
+		local landmarks = { name = "Landmarks (scanned)", kind = "auto", locs = {} }
+		local used = {}
+		local function uniqueName(base)
+			used[base] = (used[base] or 0) + 1
+			return used[base] == 1 and base or (base .. " " .. used[base])
+		end
+
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d:IsA("SpawnLocation") and #spawns.locs < 40 then
+				local p = d.Position + Vector3.new(0, d.Size.Y / 2 + 3, 0)
+				local label = d.Name
+				if d.Neutral == false and d.TeamColor then
+					label = label .. " (" .. tostring(d.TeamColor) .. ")"
+				end
+				table.insert(spawns.locs, { name = uniqueName(label), x = p.X, y = p.Y, z = p.Z })
+			end
+		end
+
+		local found = {}
+		for _, child in ipairs(workspace:GetChildren()) do
+			if child:IsA("Model") and not Players:GetPlayerFromCharacter(child) and not child:FindFirstChildOfClass("Humanoid") then
+				local ok, cf, size = pcall(function()
+					return child:GetBoundingBox()
+				end)
+				if ok and cf and size then
+					table.insert(found, { name = child.Name, pos = cf.Position + Vector3.new(0, size.Y / 2 + 4, 0), vol = size.X * size.Y * size.Z })
+				end
+			end
+		end
+		table.sort(found, function(a, b)
+			return a.vol > b.vol
+		end)
+		for i = 1, math.min(#found, 40) do
+			local f = found[i]
+			table.insert(landmarks.locs, { name = uniqueName(f.name), x = f.pos.X, y = f.pos.Y, z = f.pos.Z })
+		end
+
+		autoMaps = {}
+		if #spawns.locs > 0 then
+			table.insert(autoMaps, spawns)
+		end
+		if #landmarks.locs > 0 then
+			table.insert(autoMaps, landmarks)
+		end
+		return #spawns.locs, #landmarks.locs
+	end
+
+	-----------------------------------------------------------------
+	-- UI
+	-----------------------------------------------------------------
+	worldTab:Section("Coordinates")
+	local coordBox
+	worldPosRow = worldTab:InfoRow("Your position", positionText(), function(shown)
+		if shown ~= "N/A" and coordBox then
+			coordBox.Set(shown)
+		end
+		return copyToClipboard(shown) and "Copied!" or "Filled in below"
+	end)
+	coordBox = worldTab:TextInput("X, Y, Z", "e.g. 0, 50, 0")
+	worldTab:Button("Teleport to coordinates", function()
+		local x, y, z = parseCoords(coordBox.Get())
+		if not x then
+			notify("Type three numbers, like 0, 50, 0", "warn")
+			return
+		end
+		if Teleport.ToPosition(Vector3.new(x, y, z)) then
+			notify(string.format("Teleported to %.0f, %.0f, %.0f", x, y, z), "success")
+		else
+			notify("Your character isn't loaded", "error")
+		end
+	end)
+	worldTab:Label("Tap Your position to copy it and fill the box. Coordinates also show in Settings > Info.")
+
+	worldTab:Section("Maps")
+	local mapNote = worldTab:Label("Tap a map, then a location. Preset and scanned maps are read-only: duplicate one to edit it.")
+	local mapsBox = worldTab:LogBox(96, 60, "No maps yet")
+	local locsBox = worldTab:LogBox(150, 120, "Select a map above")
+
+	local selectedMap, selectedLoc
+	local refreshMaps
+
+	local function kindTag(kind)
+		if kind == "preset" then
+			return ' <font color="#6c80ff">[preset]</font>'
+		elseif kind == "auto" then
+			return ' <font color="#f2b23c">[scanned]</font>'
+		end
+		return ' <font color="#9090a6">[yours]</font>'
+	end
+
+	local function refreshLocs()
+		locsBox.Clear()
+		if not selectedMap then
+			return
+		end
+		for _, loc in ipairs(selectedMap.locs) do
+			local base = escapeRich(loc.name) .. ' <font color="#9090a6">' .. string.format("%.0f, %.0f, %.0f", loc.x, loc.y, loc.z) .. "</font>"
+			local label
+			label = locsBox.Add(base, function()
+				selectedLoc = (selectedLoc == loc) and nil or loc
+				refreshLocs()
+			end)
+			if selectedLoc == loc then
+				label.Text = '<font color="#6c80ff"><b>\u{25B6}</b></font> <b>' .. escapeRich(loc.name) .. "</b>" .. ' <font color="#9090a6">' .. string.format("%.0f, %.0f, %.0f", loc.x, loc.y, loc.z) .. "</font>"
+			end
+		end
+	end
+
+	function refreshMaps()
+		local list = allMaps()
+		-- keep the selection only if that map still exists
+		local still = false
+		for _, m in ipairs(list) do
+			if m == selectedMap then
+				still = true
+			end
+		end
+		if not still then
+			selectedMap, selectedLoc = nil, nil
+		end
+		mapsBox.Clear()
+		for _, m in ipairs(list) do
+			local name = escapeRich(m.name) .. ' <font color="#9090a6">(' .. #m.locs .. ")</font>" .. kindTag(m.kind)
+			local label = mapsBox.Add(name, function()
+				selectedMap = (selectedMap == m) and nil or m
+				selectedLoc = nil
+				refreshMaps()
+			end)
+			if selectedMap == m then
+				label.Text = '<font color="#6c80ff"><b>\u{25B6}</b></font> <b>' .. escapeRich(m.name) .. "</b>" .. kindTag(m.kind)
+			end
+		end
+		mapNote.Text = selectedMap and ("Selected map: " .. selectedMap.name .. ". Tap a location, then Teleport.")
+			or "Tap a map, then a location. Preset and scanned maps are read-only: duplicate one to edit it."
+		refreshLocs()
+	end
+
+	worldTab:Button("Teleport to selected location", function()
+		if not selectedLoc then
+			notify("Select a location first", "warn")
+			return
+		end
+		if Teleport.ToPosition(Vector3.new(selectedLoc.x, selectedLoc.y, selectedLoc.z)) then
+			notify("Teleported to " .. selectedLoc.name, "success")
+		else
+			notify("Your character isn't loaded", "error")
+		end
+	end)
+	worldTab:Button("Scan map for spawns and landmarks", function(lbl)
+		local original = lbl.Text
+		lbl.Text = "Scanning..."
+		local ok, spawnCount, landCount = pcall(scanWorld)
+		lbl.Text = original
+		if not ok then
+			notify("Scan failed", "error")
+			return
+		end
+		refreshMaps()
+		notify(string.format("Found %d spawns, %d landmarks", spawnCount, landCount), (spawnCount + landCount) > 0 and "success" or "warn")
+	end)
+
+	worldTab:Section("Your maps")
+	local newMapName = worldTab:TextInput("Map name", "e.g. My base spots")
+	worldTab:Button("Create map", function()
+		local name = (newMapName.Get() or ""):match("^%s*(.-)%s*$")
+		if name == "" then
+			notify("Type a map name first", "warn")
+			return
+		end
+		for _, m in ipairs(allMaps()) do
+			if m.name:lower() == name:lower() then
+				notify("A map with that name already exists", "warn")
+				return
+			end
+		end
+		local map = { name = name, gameId = gameKey, kind = "custom", locs = {} }
+		table.insert(customMaps, map)
+		saveMaps()
+		selectedMap, selectedLoc = map, nil
+		newMapName.Set("")
+		refreshMaps()
+		notify("Created map " .. name, "success")
+	end)
+	worldTab:Button("Duplicate selected map", function()
+		if not selectedMap then
+			notify("Select a map first", "warn")
+			return
+		end
+		local base = selectedMap.name .. " copy"
+		local name, n = base, 1
+		local function taken(nm)
+			for _, m in ipairs(allMaps()) do
+				if m.name:lower() == nm:lower() then
+					return true
+				end
+			end
+			return false
+		end
+		while taken(name) do
+			n += 1
+			name = base .. " " .. n
+		end
+		local map = { name = name, gameId = gameKey, kind = "custom", locs = {} }
+		for _, l in ipairs(selectedMap.locs) do
+			table.insert(map.locs, { name = l.name, x = l.x, y = l.y, z = l.z })
+		end
+		table.insert(customMaps, map)
+		saveMaps()
+		selectedMap, selectedLoc = map, nil
+		refreshMaps()
+		notify("Duplicated into " .. name, "success")
+	end)
+
+	local newLocName = worldTab:TextInput("Location name", "e.g. Vault")
+	local function addLocation(x, y, z)
+		if not selectedMap or selectedMap.kind ~= "custom" then
+			notify("Select one of your own maps first", "warn")
+			return
+		end
+		local name = (newLocName.Get() or ""):match("^%s*(.-)%s*$")
+		if name == "" then
+			name = "Location " .. (#selectedMap.locs + 1)
+		end
+		table.insert(selectedMap.locs, { name = name, x = x, y = y, z = z })
+		saveMaps()
+		newLocName.Set("")
+		refreshMaps()
+		notify("Saved " .. name, "success")
+	end
+	worldTab:Button("Save my position to map", function()
+		local root = getRoot()
+		if not root then
+			notify("Your character isn't loaded", "error")
+			return
+		end
+		local p = root.Position
+		addLocation(p.X, p.Y, p.Z)
+	end)
+	worldTab:Button("Save typed coordinates to map", function()
+		local x, y, z = parseCoords(coordBox.Get())
+		if not x then
+			notify("Type three numbers in the X, Y, Z box first", "warn")
+			return
+		end
+		addLocation(x, y, z)
+	end)
+	worldTab:Button("Delete selected location", function()
+		if not selectedMap or selectedMap.kind ~= "custom" then
+			notify("Select a location in one of your own maps", "warn")
+			return
+		end
+		if not selectedLoc then
+			notify("Select a location first", "warn")
+			return
+		end
+		for i, l in ipairs(selectedMap.locs) do
+			if l == selectedLoc then
+				table.remove(selectedMap.locs, i)
+				break
+			end
+		end
+		selectedLoc = nil
+		saveMaps()
+		refreshMaps()
+	end, true)
+	worldTab:Button("Delete selected map", function()
+		if not selectedMap or selectedMap.kind ~= "custom" then
+			notify("Select one of your own maps first", "warn")
+			return
+		end
+		for i, m in ipairs(customMaps) do
+			if m == selectedMap then
+				table.remove(customMaps, i)
+				break
+			end
+		end
+		selectedMap, selectedLoc = nil, nil
+		saveMaps()
+		refreshMaps()
+		notify("Map deleted", "info")
+	end, true)
+	worldTab:Label(fileSystemAvailable() and "Your maps are saved to a file and stay available in this game next time."
+		or "Your executor has no file access, so your maps only last until you close Toolx.")
+
+	-- spawns are picked up in the background so the Spawns map is ready when you open the tab
+	task.spawn(function()
+		pcall(scanWorld)
+		if gui.Parent then
+			refreshMaps()
+		end
+	end)
+	refreshMaps()
+
+	-- live position (World tab + Settings > Info)
+	task.spawn(function()
+		while gui.Parent do
+			local text = positionText()
+			worldPosRow.Set(text)
+			if settingsPosRow then
+				settingsPosRow.Set(text)
+			end
+			task.wait(0.2)
+		end
+	end)
+end
+
 local playersToken = 0
 local function refreshPlayers()
 	playersToken += 1
@@ -7054,6 +7534,7 @@ end)
 local timeRow = settingsTab:InfoRow("Time in game", "00:00:00", copyValue)
 local pingRow = settingsTab:InfoRow("Ping", "N/A", copyValue)
 local fpsRow = settingsTab:InfoRow("FPS", "--", copyValue)
+settingsPosRow = settingsTab:InfoRow("Position", positionText(), copyValue)
 settingsTab:InfoRow("Display name", player.DisplayName, copyValue)
 settingsTab:InfoRow("Username", player.Name, copyValue)
 settingsTab:InfoRow("User ID", tostring(player.UserId), copyValue)

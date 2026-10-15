@@ -251,6 +251,331 @@ if not mount() then
 	return
 end
 
+---------------------------------------------------------------------
+-- First-run notice: shown once, before anything else starts
+---------------------------------------------------------------------
+do
+	local CONSENT_VERSION = 1 -- raise this number if the notice changes and should be shown again
+	local CONSENT_FILE = SAVE_FOLDER .. "/consent.json"
+	local canSave = fileSystemAvailable()
+
+	local function alreadyAccepted()
+		if not canSave then
+			return false
+		end
+		local ok, accepted = pcall(function()
+			if not isfile(CONSENT_FILE) then
+				return false
+			end
+			local data = HttpService:JSONDecode(readfile(CONSENT_FILE))
+			return typeof(data) == "table" and (tonumber(data.version) or 0) >= CONSENT_VERSION
+		end)
+		return ok and accepted == true
+	end
+
+	local function saveAccepted()
+		if not canSave then
+			return
+		end
+		pcall(function()
+			if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(SAVE_FOLDER) then
+				makefolder(SAVE_FOLDER)
+			end
+			writefile(CONSENT_FILE, HttpService:JSONEncode({ version = CONSENT_VERSION, accepted = os.time() }))
+		end)
+	end
+
+	local pages = {
+		{
+			title = "Welcome to Toolx",
+			body = "Please read this short notice. It only appears the first time you run Toolx.\n\n"
+				.. "Toolx is a powerful toolkit. A few of its features have privacy or security trade-offs, and you should know about them before you use it.\n\n"
+				.. "Use <b>Next</b> to go through each one.",
+		},
+		{
+			title = "Your Roblox account",
+			body = "Executors and scripts can go against Roblox's Terms of Use. Your account can be warned, banned or deleted, and Toolx can't prevent that.\n\n"
+				.. "If you're worried about your main account, consider using an alt. You use Toolx at your own risk.",
+		},
+		{
+			title = "Downloaded code runs on your device",
+			body = "The script browser (ScriptBlox, Rscripts, xScripts), Dex, the mobile keyboard, Modules and the UNC / sUNC tests download code from the internet and run it. "
+				.. "That code gets full executor access, so a malicious script or a hijacked repository could steal data or cause damage.\n\n"
+				.. "Some sources load from branches that can change at any time without notice. Only run scripts you trust.",
+		},
+		{
+			title = "Loadlogger and hooks",
+			body = "Loadlogger is <b>on by default</b>. It hooks loadstring, HttpGet and namecall to log scripts that run through them, including scripts from other tools.\n\n"
+				.. "Links in that log can contain keys or tokens, so be careful where you copy them. Hooks like these can also be detected by anti-cheat.\n\n"
+				.. "You can turn Loadlogger off in the Tools tab.",
+		},
+		{
+			title = "Saved files and other scripts",
+			body = "Toolx saves files in a folder called <b>Toolx</b> in your executor's workspace: your options, your Rscripts API key (as plain text) and a Players online sign-in token. "
+				.. "Other scripts running in your executor can read those files.\n\n"
+				.. "Toolx also exposes itself as getgenv().Toolx, so other scripts you run can control it, including closing it.",
+		},
+		{
+			title = "Players online",
+			body = "By default, Toolx lists you in a shared <b>Players online</b> list stored on Google Firebase. It shares your Roblox username, display name and when you were last active. "
+				.. "Anyone who gets the project's public key can read that list, which shows that you use Toolx.\n\n"
+				.. "Firebase and the other services Toolx contacts (GitHub, ScriptBlox, Rscripts, Roblox) can see your IP address.\n\n"
+				.. "Your entry is removed when you close Toolx or switch off <b>Show me in Players online</b> on the Main tab.",
+		},
+		{
+			title = "Almost done",
+			body = "Please confirm below that you understand. After that you won't be asked again."
+				.. (canSave and "" or "\n\nYour executor can't save files, so this notice will appear every time you run Toolx."),
+		},
+	}
+
+	local function showNotice()
+		local overlay = new("Frame", {
+			Name = "FirstRunNotice",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Color3.new(0, 0, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Active = true, -- swallows taps so nothing behind it gets clicked
+		}, gui)
+
+		local card = new("CanvasGroup", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.new(0.92, 0, 0.9, 0),
+			BackgroundColor3 = theme.bg,
+			BorderSizePixel = 0,
+			GroupTransparency = 1,
+		}, overlay)
+		new("UISizeConstraint", { MaxSize = Vector2.new(420, 380), MinSize = Vector2.new(260, 220) }, card)
+		corner(card, 14)
+		stroke(card, 0.85)
+
+		new("TextLabel", {
+			Text = "Before you start",
+			Font = Enum.Font.GothamBold,
+			TextSize = 14,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(16, 0),
+			Size = UDim2.new(1, -90, 0, 38),
+		}, card)
+
+		local exitBtn = new("TextButton", {
+			Text = "Exit",
+			Font = Enum.Font.GothamMedium,
+			TextSize = 12,
+			TextColor3 = theme.dim,
+			AutoButtonColor = false,
+			BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -10, 0, 6),
+			Size = UDim2.fromOffset(56, 26),
+		}, card)
+		exitBtn.MouseEnter:Connect(function()
+			exitBtn.TextColor3 = theme.red
+		end)
+		exitBtn.MouseLeave:Connect(function()
+			exitBtn.TextColor3 = theme.dim
+		end)
+
+		local scroller = new("ScrollingFrame", {
+			Position = UDim2.fromOffset(14, 40),
+			Size = UDim2.new(1, -28, 1, -40 - 54),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 3,
+			ScrollBarImageColor3 = theme.accent,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+		}, card)
+		new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, scroller)
+		new("UIPadding", { PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6) }, scroller)
+
+		local pageLabel = new("TextLabel", {
+			Font = Enum.Font.GothamMedium,
+			TextSize = 11,
+			TextColor3 = theme.dim,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 14),
+			LayoutOrder = 1,
+		}, scroller)
+		local heading = new("TextLabel", {
+			Font = Enum.Font.GothamBold,
+			TextSize = 16,
+			TextColor3 = theme.accent,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextWrapped = true,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = 2,
+		}, scroller)
+		local bodyText = new("TextLabel", {
+			RichText = true,
+			Font = Enum.Font.Gotham,
+			TextSize = 13,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			TextWrapped = true,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = 3,
+		}, scroller)
+
+		-- the checkbox, only visible on the last page
+		local checked = false
+		local checkRow = new("TextButton", {
+			Text = "",
+			AutoButtonColor = false,
+			BackgroundColor3 = theme.surface,
+			BackgroundTransparency = 0.35,
+			BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 0, 44),
+			LayoutOrder = 4,
+			Visible = false,
+		}, scroller)
+		corner(checkRow, 8)
+		stroke(checkRow, 0.94)
+		local box = new("Frame", {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 12, 0.5, 0),
+			Size = UDim2.fromOffset(22, 22),
+			BackgroundColor3 = theme.off,
+			BorderSizePixel = 0,
+		}, checkRow)
+		corner(box, 6)
+		local tick = new("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(12, 12),
+			BackgroundColor3 = theme.accent,
+			BorderSizePixel = 0,
+			Visible = false,
+		}, box)
+		corner(tick, 3)
+		new("TextLabel", {
+			Text = "I have read this and I understand the risks.",
+			Font = Enum.Font.GothamMedium,
+			TextSize = 12,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextWrapped = true,
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(44, 0),
+			Size = UDim2.new(1, -52, 1, 0),
+		}, checkRow)
+
+		-- footer buttons
+		local footer = new("Frame", {
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.new(0, 14, 1, -10),
+			Size = UDim2.new(1, -28, 0, 36),
+			BackgroundTransparency = 1,
+		}, card)
+		new("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			Padding = UDim.new(0, 8),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}, footer)
+
+		local function makeButton(text, order)
+			local b = new("TextButton", {
+				Text = text,
+				Font = Enum.Font.GothamBold,
+				TextSize = 13,
+				AutoButtonColor = false,
+				BorderSizePixel = 0,
+				Size = UDim2.new(1 / 3, -6, 1, 0),
+				LayoutOrder = order,
+			}, footer)
+			corner(b, 8)
+			return b
+		end
+		local prevBtn = makeButton("Previous", 1)
+		local nextBtn = makeButton("Next", 2)
+		local okBtn = makeButton("Ok", 3)
+		local enabled = { [prevBtn] = false, [nextBtn] = true, [okBtn] = false }
+
+		local function paint(btn, on, primary)
+			enabled[btn] = on
+			btn.BackgroundColor3 = (on and primary) and theme.accent or theme.surface
+			btn.BackgroundTransparency = on and 0 or 0.6
+			btn.TextColor3 = on and theme.text or theme.dim
+		end
+
+		local page = 1
+		local decision -- "ok" or "exit"
+
+		local function refresh()
+			local p = pages[page]
+			pageLabel.Text = string.format("Page %d of %d", page, #pages)
+			heading.Text = p.title
+			bodyText.Text = p.body
+			checkRow.Visible = page == #pages
+			scroller.CanvasPosition = Vector2.new(0, 0)
+			paint(prevBtn, page > 1)
+			paint(nextBtn, page < #pages)
+			paint(okBtn, page == #pages and checked, true)
+		end
+
+		prevBtn.Activated:Connect(function()
+			if enabled[prevBtn] then
+				page -= 1
+				refresh()
+			end
+		end)
+		nextBtn.Activated:Connect(function()
+			if enabled[nextBtn] then
+				page += 1
+				refresh()
+			end
+		end)
+		checkRow.Activated:Connect(function()
+			checked = not checked
+			tick.Visible = checked
+			box.BackgroundColor3 = checked and theme.surface or theme.off
+			refresh()
+		end)
+		okBtn.Activated:Connect(function()
+			if enabled[okBtn] then
+				decision = "ok"
+			end
+		end)
+		exitBtn.Activated:Connect(function()
+			decision = "exit"
+		end)
+
+		refresh()
+		tween(overlay, 0.3, { BackgroundTransparency = 0.45 })
+		tween(card, 0.35, { GroupTransparency = 0 })
+
+		while decision == nil and gui.Parent do
+			task.wait(0.05)
+		end
+
+		tween(overlay, 0.25, { BackgroundTransparency = 1 })
+		tween(card, 0.25, { GroupTransparency = 1 })
+		task.wait(0.3)
+		overlay:Destroy()
+		return decision == "ok"
+	end
+
+	if not alreadyAccepted() then
+		if showNotice() then
+			saveAccepted()
+		else
+			gui:Destroy()
+			return
+		end
+	end
+end
+
 local blur = new("BlurEffect", { Name = "ToolxBlur", Size = 0 }, Lighting)
 local blurEnabled = true
 
@@ -5153,6 +5478,7 @@ end
 ---------------------------------------------------------------------
 -- Main tab (profile header, trending scripts / games, search)
 ---------------------------------------------------------------------
+local Presence = {}
 local mainTab = addTab("Main")
 do
 	local TeleportService = game:GetService("TeleportService")
@@ -5912,6 +6238,360 @@ do
 			avatar.Image = img
 		end
 	end)
+
+	-----------------------------------------------------------------
+	-- Players online (Firebase Realtime Database, anonymous auth)
+	-- Setup: fill in PRESENCE.url and PRESENCE.apiKey (see firebase-rules.json)
+	-----------------------------------------------------------------
+	local PRESENCE = {
+	  url = "https://YOUR-PROJECT-default-rtdb.firebaseio.com", -- Realtime Database URL, no trailing slash
+	  apiKey = "YOUR_FIREBASE_WEB_API_KEY",                     -- Project settings > Web API key
+	  beat = 30,    -- seconds between "I'm here" updates
+	  poll = 60,    -- seconds between list refreshes
+	  window = 90,  -- seen within this many seconds = online
+	  limit = 100,  -- most entries downloaded per refresh (keeps bandwidth bounded)
+	  authFile = SAVE_FOLDER .. "/presence.auth",
+	}
+	local P = {
+	  token = nil, refresh = nil, uid = nil, expires = 0,
+	  offset = 0, share = true, running = true,
+	  users = {}, err = nil, beatNow = true, pollNow = true,
+	}
+	local presenceConfigured = not (
+	  string.find(PRESENCE.url, "YOUR-PROJECT", 1, true) or string.find(PRESENCE.apiKey, "YOUR_", 1, true)
+	)
+
+	local function httpReq(opts)
+	  local req = (typeof(request) == "function" and request)
+	    or (typeof(http_request) == "function" and http_request)
+	    or (typeof(syn) == "table" and syn.request)
+	  if not req then
+	    return nil, 0, "Your executor has no request() function."
+	  end
+	  local ok, res = pcall(req, opts)
+	  if not ok or typeof(res) ~= "table" then
+	    return nil, 0, "Couldn't reach Firebase."
+	  end
+	  return res, tonumber(res.StatusCode) or 0
+	end
+
+	local function decode(body)
+	  local ok, data = pcall(function()
+	    return HttpService:JSONDecode(body)
+	  end)
+	  return ok and data or nil
+	end
+
+	local function saveRefreshToken()
+	  if not fileSystemAvailable() or not P.refresh then
+	    return
+	  end
+	  pcall(function()
+	    if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(SAVE_FOLDER) then
+	      makefolder(SAVE_FOLDER)
+	    end
+	    writefile(PRESENCE.authFile, P.refresh)
+	  end)
+	end
+
+	if fileSystemAvailable() then
+	  pcall(function()
+	    if isfile(PRESENCE.authFile) then
+	      local raw = readfile(PRESENCE.authFile)
+	      if typeof(raw) == "string" and #raw > 20 then
+	        P.refresh = raw
+	      end
+	    end
+	  end)
+	end
+
+	local function authenticate()
+	  if P.token and os.time() < P.expires - 60 then
+	    return true
+	  end
+	  local key = PRESENCE.apiKey
+	  if P.refresh then
+	    local res, status = httpReq({
+	      Url = "https://securetoken.googleapis.com/v1/token?key=" .. key,
+	      Method = "POST",
+	      Headers = { ["Content-Type"] = "application/x-www-form-urlencoded" },
+	      Body = "grant_type=refresh_token&refresh_token=" .. HttpService:UrlEncode(P.refresh),
+	    })
+	    local d = res and status == 200 and decode(res.Body)
+	    if d and d.id_token then
+	      P.token, P.uid = d.id_token, d.user_id
+	      P.refresh = d.refresh_token or P.refresh
+	      P.expires = os.time() + (tonumber(d.expires_in) or 3600)
+	      saveRefreshToken()
+	      return true
+	    end
+	    P.refresh = nil
+	  end
+	  local res, status, why = httpReq({
+	    Url = "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" .. key,
+	    Method = "POST",
+	    Headers = { ["Content-Type"] = "application/json" },
+	    Body = '{"returnSecureToken":true}',
+	  })
+	  if not res then
+	    P.err = why
+	    return false
+	  end
+	  local d = decode(res.Body)
+	  if status == 200 and d and d.idToken then
+	    P.token, P.refresh, P.uid = d.idToken, d.refreshToken, d.localId
+	    P.expires = os.time() + (tonumber(d.expiresIn) or 3600)
+	    saveRefreshToken()
+	    return true
+	  end
+	  local msg = d and d.error and tostring(d.error.message) or ""
+	  if string.find(msg, "OPERATION_NOT_ALLOWED", 1, true) or string.find(msg, "ADMIN_ONLY", 1, true) then
+	    P.err = "Turn on Anonymous sign-in in Firebase (Authentication > Sign-in method)."
+	  elseif string.find(msg, "API key", 1, true) then
+	    P.err = "The Firebase API key isn't valid."
+	  else
+	    P.err = "Firebase sign-in failed (" .. status .. ")."
+	  end
+	  return false
+	end
+
+	local function dbUrl(path, extra)
+	  return PRESENCE.url .. path .. ".json?auth=" .. P.token .. (extra or "")
+	end
+
+	local function beat()
+	  if not authenticate() then
+	    return false
+	  end
+	  local res, status, why = httpReq({
+	    Url = dbUrl("/presence/" .. P.uid),
+	    Method = "PUT",
+	    Headers = { ["Content-Type"] = "application/json" },
+	    Body = HttpService:JSONEncode({
+	      n = player.Name,
+	      d = player.DisplayName,
+	      t = { [".sv"] = "timestamp" },
+	    }),
+	  })
+	  if not res then
+	    P.err = why
+	    return false
+	  end
+	  if status == 200 then
+	    local d = decode(res.Body)
+	    if d and tonumber(d.t) then
+	      P.offset = d.t - os.time() * 1000 -- server clock vs this device's clock
+	    end
+	    P.err = nil
+	    return true
+	  end
+	  if status == 401 then
+	    P.token = nil
+	  end
+	  P.err = status == 401 and "Firebase rejected the sign-in." or "Firebase rules blocked the update (" .. status .. ")."
+	  return false
+	end
+
+	local function leave()
+	  if not (P.token and P.uid) then
+	    return
+	  end
+	  httpReq({ Url = dbUrl("/presence/" .. P.uid), Method = "DELETE" })
+	end
+
+	local function fetchOnline()
+	  if not authenticate() then
+	    return
+	  end
+	  local cutoff = os.time() * 1000 + P.offset - PRESENCE.window * 1000
+	  local res, status, why = httpReq({
+	    Url = dbUrl("/presence", string.format("&orderBy=%%22t%%22&startAt=%d&limitToLast=%d", cutoff, PRESENCE.limit)),
+	    Method = "GET",
+	  })
+	  if not res then
+	    P.err = why
+	    return
+	  end
+	  if status ~= 200 then
+	    P.err = status == 401 and "Firebase rejected the sign-in." or "Couldn't read the list (" .. status .. "). Check your rules and .indexOn."
+	    return
+	  end
+	  P.err = nil
+	  local data = decode(res.Body)
+	  local list = {}
+	  if typeof(data) == "table" then
+	    for uid, v in pairs(data) do
+	      if typeof(v) == "table" and typeof(v.n) == "string" then
+	        table.insert(list, { name = v.n, display = typeof(v.d) == "string" and v.d or v.n, me = uid == P.uid })
+	      end
+	    end
+	  end
+	  table.sort(list, function(a, b)
+	    if a.me ~= b.me then
+	      return a.me
+	    end
+	    return string.lower(a.display) < string.lower(b.display)
+	  end)
+	  P.users = list
+	end
+
+	-- UI: collapsed card with the count, tap to open the list
+	local ROW_H, LIST_ROWS, CARD_H = 22, 5, 40
+	local onlineBox = mainTab:Container(CARD_H)
+	onlineBox.ClipsDescendants = true
+	local onlineCard = new("TextButton", {
+	  Text = "",
+	  AutoButtonColor = false,
+	  Size = UDim2.new(1, 0, 0, CARD_H),
+	  BackgroundColor3 = theme.surface,
+	  BackgroundTransparency = 0.35,
+	  BorderSizePixel = 0,
+	}, onlineBox)
+	corner(onlineCard, 12)
+	stroke(onlineCard, 0.94)
+	local onlineDot = new("Frame", {
+	  Position = UDim2.new(0, 14, 0.5, -4),
+	  Size = UDim2.fromOffset(8, 8),
+	  BackgroundColor3 = theme.dim,
+	  BorderSizePixel = 0,
+	}, onlineCard)
+	corner(onlineDot, 4)
+	new("TextLabel", {
+	  Text = "Players online",
+	  Font = Enum.Font.GothamMedium,
+	  TextSize = 13,
+	  TextColor3 = theme.text,
+	  TextXAlignment = Enum.TextXAlignment.Left,
+	  BackgroundTransparency = 1,
+	  Position = UDim2.fromOffset(30, 0),
+	  Size = UDim2.new(0.5, -30, 1, 0),
+	}, onlineCard)
+	local onlineCount = new("TextLabel", {
+	  Text = presenceConfigured and "..." or "Setup needed",
+	  Font = Enum.Font.GothamBold,
+	  TextSize = 13,
+	  TextColor3 = theme.dim,
+	  TextXAlignment = Enum.TextXAlignment.Right,
+	  BackgroundTransparency = 1,
+	  AnchorPoint = Vector2.new(1, 0),
+	  Position = UDim2.new(1, -14, 0, 0),
+	  Size = UDim2.new(0.5, -14, 1, 0),
+	}, onlineCard)
+	local onlineList = new("ScrollingFrame", {
+	  Position = UDim2.fromOffset(0, CARD_H + 4),
+	  Size = UDim2.new(1, 0, 0, 0),
+	  BackgroundTransparency = 1,
+	  BorderSizePixel = 0,
+	  ScrollBarThickness = 2,
+	  ScrollBarImageColor3 = theme.accent,
+	  CanvasSize = UDim2.new(),
+	  AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	}, onlineBox)
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, onlineList)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, onlineList)
+
+	local onlineOpen = false
+	local function renderOnline()
+	  if not onlineBox.Parent then
+	    return
+	  end
+	  local n = #P.users
+	  local text, color
+	  if not presenceConfigured then
+	    text, color = "Setup needed", theme.amber
+	  elseif P.err and n == 0 then
+	    text, color = "Offline", theme.red
+	  else
+	    text = (n >= PRESENCE.limit) and (PRESENCE.limit .. "+") or tostring(n)
+	    color = theme.text
+	  end
+	  onlineCount.Text, onlineCount.TextColor3 = text, color
+	  onlineDot.BackgroundColor3 = (presenceConfigured and not P.err) and toastColors.success or theme.dim
+
+	  for _, c in ipairs(onlineList:GetChildren()) do
+	    if c:IsA("TextLabel") then
+	      c:Destroy()
+	    end
+	  end
+	  local rows = math.max(n, 1)
+	  if n == 0 then
+	    local msg = not presenceConfigured and "Add your Firebase URL and API key at the top of the Players online block."
+	      or P.err or "Nobody online yet."
+	    new("TextLabel", {
+	      Text = msg,
+	      Font = Enum.Font.Gotham,
+	      TextSize = 11,
+	      TextColor3 = theme.dim,
+	      TextWrapped = true,
+	      TextXAlignment = Enum.TextXAlignment.Left,
+	      BackgroundTransparency = 1,
+	      Size = UDim2.new(1, 0, 0, 34),
+	    }, onlineList)
+	    rows = 1.5
+	  end
+	  for i, u in ipairs(P.users) do
+	    new("TextLabel", {
+	      Text = u.display .. "  <font color=\"#9090a6\">@" .. u.name .. "</font>" .. (u.me and "  <font color=\"#6c80ff\">you</font>" or ""),
+	      RichText = true,
+	      Font = Enum.Font.GothamMedium,
+	      TextSize = 12,
+	      TextColor3 = theme.text,
+	      TextXAlignment = Enum.TextXAlignment.Left,
+	      TextTruncate = Enum.TextTruncate.AtEnd,
+	      BackgroundTransparency = 1,
+	      Size = UDim2.new(1, 0, 0, ROW_H),
+	      LayoutOrder = i,
+	    }, onlineList)
+	  end
+	  local listH = math.min(rows, LIST_ROWS) * ROW_H
+	  onlineList.Size = UDim2.new(1, 0, 0, listH)
+	  tween(onlineBox, 0.25, { Size = UDim2.new(1, 0, 0, onlineOpen and (CARD_H + 4 + listH + 2) or CARD_H) })
+	end
+
+	connect(onlineCard.Activated, function()
+	  onlineOpen = not onlineOpen
+	  if onlineOpen then
+	    P.pollNow = true
+	  end
+	  renderOnline()
+	end)
+
+	mainTab:Toggle("Show me in Players online", true, function(state)
+	  P.share = state
+	  if state then
+	    P.beatNow = true
+	    P.pollNow = true
+	  else
+	    task.spawn(leave)
+	  end
+	end, "presence.share")
+
+	function Presence.Unload()
+	  P.running = false
+	  if P.share then
+	    task.spawn(leave)
+	  end
+	end
+
+	if presenceConfigured then
+	  task.spawn(function()
+	    local lastBeat, lastPoll = -1e9, -1e9
+	    while gui.Parent and P.running do
+	      local now = os.clock()
+	      if P.share and (P.beatNow or now - lastBeat >= PRESENCE.beat) then
+	        P.beatNow, lastBeat = false, now
+	        beat()
+	      end
+	      if P.pollNow or now - lastPoll >= PRESENCE.poll then
+	        P.pollNow, lastPoll = false, now
+	        fetchOnline()
+	        renderOnline()
+	      end
+	      task.wait(1)
+	    end
+	  end)
+	end
+	renderOnline()
 
 	-----------------------------------------------------------------
 	-- Dropdown (Scripts / Games)
@@ -8690,6 +9370,7 @@ function Toolx.Close()
 	pcall(Perf.Unload)
 	pcall(ChatLog.Stop)
 	pcall(LoadLogger.Stop)
+	pcall(Presence.Unload)
 	pcall(Topbar.Unload)
 	tween(blur, 0.3, { Size = 0 })
 	tween(main, 0.3, { GroupTransparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)

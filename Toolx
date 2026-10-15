@@ -4738,7 +4738,7 @@ do
 
 	local mode = "Scripts" -- "Scripts" or "Games"
 	local requestId = 0
-	local provider = "ScriptBlox" -- "ScriptBlox" or "Rscripts"
+	local provider = "ScriptBlox" -- "ScriptBlox", "Rscripts" or "xScripts"
 	local RS = { api = "https://api.rscripts.net/v1/", key = "", keyFile = SAVE_FOLDER .. "/rscripts.key" }
 	local FS = { verified = false, keyless = false, gameMode = "Any game" } -- filter state + helpers
 	local updateFilterRows -- forward declarations, defined below
@@ -4949,7 +4949,7 @@ do
 				name = game:GetService("MarketplaceService"):GetProductInfo(tonumber(placeId)).Name
 			end)
 		end
-		return { placeId = placeId, name = name }
+		return { placeId = placeId, name = name, universeId = (gm == "This game") and tostring(game.GameId) or nil }
 	end
 
 	function FS.collect()
@@ -5145,7 +5145,227 @@ do
 		return list
 	end
 
+	-- xScripts: every script comes from a GitHub repo. The first 3 lines of each file hold its info:
+	--   local Key = true/false
+	--   local Verified = true/false
+	--   local GameId = "Universal" (or the game's id, several ids can be separated by commas)
+	local XS = { owner = "redxs-dosx", repo = "xScripts", branch = "main", items = nil, loading = false, maxShown = 50 }
+
+	function XS.parseHeader(body)
+		local info = { key = false, verified = false, universal = true, gameIds = {} }
+		body = body:gsub("^\239\187\191", "") -- strip a UTF-8 BOM
+		local lineNo = 0
+		for line in (body .. "\n"):gmatch("(.-)\r?\n") do
+			lineNo += 1
+			if lineNo > 3 then
+				break
+			end
+			line = line:gsub("%-%-.*$", "")
+			local name, value = line:match("^%s*local%s+([%w_]+)%s*=%s*(.-)%s*;?%s*$")
+			if name and value then
+				name = name:lower()
+				if name == "key" then
+					info.key = value:lower() == "true"
+				elseif name == "verified" then
+					info.verified = value:lower() == "true"
+				elseif name == "gameid" then
+					if value:lower():find("universal", 1, true) then
+						info.universal = true
+					else
+						local ids = {}
+						for id in value:gmatch("%d+") do
+							table.insert(ids, id)
+						end
+						if #ids > 0 then
+							info.universal = false
+							info.gameIds = ids
+						end
+					end
+				end
+			end
+		end
+		return info
+	end
+
+	function XS.makeItem(path, body, rawUrl)
+		local info = XS.parseHeader(body)
+		local file = path:match("([^/]+)$") or path
+		return {
+			provider = "xScripts",
+			title = (file:gsub("%.luau?$", "")),
+			path = path,
+			source = body,
+			rawUrl = rawUrl,
+			universal = info.universal,
+			gameIds = info.gameIds,
+			gameId = info.gameIds[1],
+			game = (not info.universal and info.gameIds[1]) and ("Game " .. table.concat(info.gameIds, ", ")) or nil,
+			verified = info.verified,
+			key = info.key,
+		}
+	end
+
+	-- Lists every .lua / .luau file in the repo with one API call, then downloads them a few at a time
+	function XS.build()
+		local base = "https://raw.githubusercontent.com/" .. XS.owner .. "/" .. XS.repo .. "/" .. XS.branch .. "/"
+		local data = fetchJson("https://api.github.com/repos/" .. XS.owner .. "/" .. XS.repo .. "/git/trees/" .. XS.branch .. "?recursive=1")
+		if not data or typeof(data.tree) ~= "table" then
+			return nil, "Couldn't read the xScripts repo. GitHub may be rate limiting you, try again in a while."
+		end
+		local files = {}
+		for _, node in ipairs(data.tree) do
+			if typeof(node) == "table" and node.type == "blob" and typeof(node.path) == "string" and node.path:lower():match("%.luau?$") then
+				table.insert(files, node.path)
+			end
+		end
+		if #files == 0 then
+			return nil, "The xScripts repo has no scripts yet."
+		end
+
+		local results, cursor, active = {}, 0, 0
+		local function worker()
+			while true do
+				cursor += 1
+				local i = cursor
+				local path = files[i]
+				if not path then
+					break
+				end
+				local encoded = (path:gsub("[^/]+", function(seg)
+					return HttpService:UrlEncode(seg)
+				end))
+				local url = base .. encoded
+				local body = fetchUrl(url)
+				if body then
+					results[i] = XS.makeItem(path, body, url)
+				end
+			end
+			active -= 1
+		end
+		for _ = 1, math.min(8, #files) do
+			active += 1
+			task.spawn(worker)
+		end
+		local waited = 0
+		while active > 0 and waited < 60 do
+			task.wait(0.1)
+			waited += 0.1
+		end
+
+		local items = {}
+		for i = 1, #files do
+			if results[i] then
+				table.insert(items, results[i])
+			end
+		end
+		if #items == 0 then
+			return nil, "Couldn't download any xScripts scripts. Check that your executor allows HTTP requests."
+		end
+		table.sort(items, function(a, b)
+			return a.title:lower() < b.title:lower()
+		end)
+		return items
+	end
+
+	-- Loaded once per session; searches after that are instant
+	function XS.load()
+		if XS.items then
+			return XS.items
+		end
+		if XS.loading then
+			local waited = 0
+			while XS.loading and waited < 70 do
+				task.wait(0.2)
+				waited += 0.2
+			end
+			if XS.items then
+				return XS.items
+			end
+			return nil, "xScripts didn't finish loading."
+		end
+		XS.loading = true
+		local ok, items, err = pcall(XS.build)
+		XS.loading = false
+		if not ok then
+			return nil, "Couldn't read the xScripts repo."
+		end
+		if items then
+			XS.items = items
+		end
+		return items, err
+	end
+
+	local function xsMatchesGame(item)
+		for _, id in ipairs(item.gameIds) do
+			if id == tostring(game.PlaceId) or id == tostring(game.GameId) then
+				return true
+			end
+		end
+		return false
+	end
+
+	function XS.fetch(query, flt)
+		local items, err = XS.load()
+		if not items then
+			return nil, err
+		end
+		local q = (query or ""):lower()
+		local list = {}
+		for _, it in ipairs(items) do
+			local keep = true
+			if flt.verified and not it.verified then
+				keep = false
+			end
+			if flt.keyless and it.key then
+				keep = false
+			end
+			if keep and flt.placeId then
+				keep = false
+				for _, id in ipairs(it.gameIds) do
+					if id == flt.placeId or (flt.universeId and id == flt.universeId) then
+						keep = true
+					end
+				end
+			end
+			if keep and q ~= "" then
+				keep = it.title:lower():find(q, 1, true) ~= nil
+					or (it.game ~= nil and it.game:lower():find(q, 1, true) ~= nil)
+					or (it.universal and ("universal"):find(q, 1, true) ~= nil)
+			end
+			if keep then
+				table.insert(list, it)
+			end
+		end
+		if #list == 0 then
+			if q ~= "" then
+				return nil, 'No xScripts scripts found for "' .. query .. '".'
+			end
+			return nil, "No xScripts scripts match your filters."
+		end
+		-- scripts made for the game you're in first, then universal ones, then the rest
+		local function rank(it)
+			if xsMatchesGame(it) then
+				return 1
+			end
+			return it.universal and 2 or 3
+		end
+		table.sort(list, function(a, b)
+			local ra, rb = rank(a), rank(b)
+			if ra ~= rb then
+				return ra < rb
+			end
+			return a.title:lower() < b.title:lower()
+		end)
+		while #list > XS.maxShown do
+			table.remove(list)
+		end
+		return list
+	end
+
 	function FS.fetch(query, flt)
+		if provider == "xScripts" then
+			return XS.fetch(query, flt)
+		end
 		if provider == "Rscripts" then
 			return RS.fetch(query, flt)
 		end
@@ -5160,6 +5380,12 @@ do
 
 	-- Search results usually include the source; otherwise ask the raw endpoint
 	local function getSource(item)
+		if item.provider == "xScripts" then
+			if item.source and #item.source > 0 then
+				return item.source
+			end
+			return item.rawUrl and fetchUrl(item.rawUrl) or nil
+		end
 		if item.provider == "Rscripts" then
 			if item.source then
 				return item.source
@@ -5510,7 +5736,7 @@ do
 	FS.rowA = FS.dropRow({
 		{
 			name = "Provider",
-			options = { "ScriptBlox", "Rscripts" },
+			options = { "ScriptBlox", "Rscripts", "xScripts" },
 			initial = provider,
 			onChange = function(v)
 				provider = v
@@ -5782,7 +6008,9 @@ do
 			if item.risk and item.risk >= 6 then
 				table.insert(tags, '<font color="#eb5757">Risk ' .. item.risk .. "/10</font>")
 			end
-			table.insert(tags, shortNumber(item.views) .. " views")
+			if item.views then
+				table.insert(tags, shortNumber(item.views) .. " views")
+			end
 			local where = item.universal and "Universal" or (item.game or "Unknown game")
 
 			new("TextLabel", {
@@ -5874,7 +6102,7 @@ do
 		local currentMode = mode
 
 		sectionLabel.Text = string.upper(
-			(searching and ('Results for "' .. query .. '"') or ("Trending " .. string.lower(currentMode)))
+			(searching and ('Results for "' .. query .. '"') or ((currentMode == "Scripts" and provider == "xScripts") and "All scripts" or ("Trending " .. string.lower(currentMode))))
 				.. (currentMode == "Scripts" and (" - " .. provider) or "")
 		)
 		clearResults()

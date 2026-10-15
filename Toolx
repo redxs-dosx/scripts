@@ -1503,6 +1503,77 @@ local function addTab(name)
 		return comp
 	end
 
+	-- Number input row: type a value and press Enter (or tap away). Invalid text snaps back to the last value.
+	function api:Input(text, default, callback, key, min, max)
+		min = min or 0
+		max = max or 100000
+		local r = row(40)
+		local value = math.clamp(default, min, max)
+
+		new("TextLabel", {
+			Text = text,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 13,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 0),
+			Size = UDim2.new(1, -100, 1, 0),
+		}, r)
+
+		local box = new("TextBox", {
+			Text = tostring(value),
+			PlaceholderText = tostring(default),
+			PlaceholderColor3 = theme.dim,
+			ClearTextOnFocus = false,
+			Font = Enum.Font.GothamBold,
+			TextSize = 13,
+			TextColor3 = theme.accent,
+			TextXAlignment = Enum.TextXAlignment.Center,
+			BackgroundColor3 = theme.bg,
+			BackgroundTransparency = 0.3,
+			BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			Size = UDim2.fromOffset(76, 26),
+		}, r)
+		corner(box, 6)
+		stroke(box, 0.9)
+
+		local function setValue(v, silent)
+			v = tonumber(v)
+			if not v or v ~= v then
+				box.Text = tostring(value)
+				return
+			end
+			v = math.clamp(math.floor(v * 100 + 0.5) / 100, min, max)
+			local changed = v ~= value
+			value = v
+			box.Text = tostring(v)
+			if changed and not silent and callback then
+				task.spawn(callback, v)
+			end
+			if changed and not silent and key then
+				optionChanged()
+			end
+		end
+
+		connect(box.FocusLost, function()
+			setValue(box.Text)
+		end)
+
+		local comp = {
+			Set = setValue,
+			Get = function()
+				return value
+			end,
+		}
+		if key then
+			registry[key] = comp
+		end
+		return comp
+	end
+
 	-- Empty frame placed in the page's list. With a height it is fixed; without one it grows to fit its children.
 	function api:Container(height)
 		local f = new("Frame", {
@@ -1882,12 +1953,14 @@ do
 end
 
 ---------------------------------------------------------------------
--- Player mods (walkspeed, jump power, anti-fling)
+-- Player mods (walkspeed, jump power, anti-fling, fly)
 ---------------------------------------------------------------------
 local Mods = {}
 do
-	local state = { walk = false, jump = false, fling = false }
-	local values = { walk = 16, jump = 50 }
+	local state = { walk = false, jump = false, fling = false, fly = false }
+	local values = { walk = 16, jump = 50, fly = 60 }
+	local flyBV, flyBG, flyGui, flyUp, flyDown
+	local flyWasPlatformStand
 	local saved = {}
 	local steppedConn, heartConn
 	local lastSafeCF
@@ -1937,10 +2010,127 @@ do
 		end
 	end
 
+
+	-- Fly: BodyVelocity moves you where the camera points (joystick / WASD), Space or the Up button rises,
+	-- LeftCtrl / Q or the Down button descends.
+	local function destroyFlyBodies()
+		if flyBV then
+			flyBV:Destroy()
+			flyBV = nil
+		end
+		if flyBG then
+			flyBG:Destroy()
+			flyBG = nil
+		end
+	end
+
+	local function makeFlyButton(text, y)
+		local b = Instance.new("TextButton")
+		b.Text = text
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 22
+		b.TextColor3 = theme.text
+		b.BackgroundColor3 = theme.surface
+		b.BackgroundTransparency = 0.25
+		b.AnchorPoint = Vector2.new(1, 0.5)
+		b.Position = UDim2.new(1, -16, 0.5, y)
+		b.Size = UDim2.fromOffset(54, 54)
+		b.AutoButtonColor = false
+		b.Parent = flyGui
+		corner(b, 27)
+		stroke(b, 0.7)
+		return b
+	end
+
+	local function showFlyButtons(on)
+		if flyGui then
+			flyGui:Destroy()
+			flyGui, flyUp, flyDown = nil, nil, nil
+		end
+		if not on or not UserInputService.TouchEnabled then
+			return
+		end
+		flyGui = Instance.new("Frame")
+		flyGui.Name = "ToolxFlyButtons"
+		flyGui.BackgroundTransparency = 1
+		flyGui.Size = UDim2.fromScale(1, 1)
+		flyGui.Parent = gui
+		local up = makeFlyButton("▲", -34)
+		local down = makeFlyButton("▼", 34)
+		flyUp, flyDown = false, false
+		up.InputBegan:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
+				flyUp = true
+			end
+		end)
+		up.InputEnded:Connect(function()
+			flyUp = false
+		end)
+		down.InputBegan:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
+				flyDown = true
+			end
+		end)
+		down.InputEnded:Connect(function()
+			flyDown = false
+		end)
+	end
+
+	local function flyStep(hum, root)
+		if not flyBV or flyBV.Parent ~= root then
+			destroyFlyBodies()
+			flyBV = Instance.new("BodyVelocity")
+			flyBV.Name = "ToolxFlyBV"
+			flyBV.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+			flyBV.Velocity = Vector3.zero
+			flyBV.Parent = root
+			flyBG = Instance.new("BodyGyro")
+			flyBG.Name = "ToolxFlyBG"
+			flyBG.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+			flyBG.P = 9e4
+			flyBG.CFrame = root.CFrame
+			flyBG.Parent = root
+		end
+		local cam = workspace.CurrentCamera
+		if not cam then
+			return
+		end
+		hum.PlatformStand = true
+
+		local cf = cam.CFrame
+		local look = cf.LookVector
+		local flatLook = Vector3.new(look.X, 0, look.Z)
+		flatLook = flatLook.Magnitude > 0.01 and flatLook.Unit or Vector3.new(0, 0, -1)
+		local flatRight = Vector3.new(-flatLook.Z, 0, flatLook.X) -- right of the flattened look vector
+
+		local move = hum.MoveDirection
+		local f = move:Dot(flatLook)
+		local rgt = move:Dot(flatRight)
+		local dir = look * f + cf.RightVector * rgt
+
+		local vertical = 0
+		if not UserInputService:GetFocusedTextBox() then
+			if UserInputService:IsKeyDown(Enum.KeyCode.Space) or flyUp then
+				vertical += 1
+			end
+			if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.Q) or flyDown then
+				vertical -= 1
+			end
+		end
+		dir += Vector3.new(0, vertical, 0)
+
+		flyBV.Velocity = dir.Magnitude > 0.01 and dir.Unit * values.fly or Vector3.zero
+		flyBG.CFrame = CFrame.new(root.Position, root.Position + flatLook)
+	end
+
 	local function onHeartbeat()
 		local hum, root = getHumanoid()
 		if not hum or not root then
 			return
+		end
+
+		if state.fly then
+			flyStep(hum, root)
 		end
 
 		if state.walk then
@@ -1970,7 +2160,7 @@ do
 	end
 
 	local function refresh()
-		if state.walk or state.jump or state.fling then
+		if state.walk or state.jump or state.fling or state.fly then
 			if not heartConn then
 				heartConn = RunService.Heartbeat:Connect(onHeartbeat)
 				steppedConn = RunService.Stepped:Connect(onStepped)
@@ -2028,6 +2218,30 @@ do
 		values.jump = v
 	end
 
+	function Mods.SetFly(on)
+		state.fly = on
+		local hum = getHumanoid()
+		if on then
+			if hum then
+				flyWasPlatformStand = hum.PlatformStand
+			end
+			showFlyButtons(true)
+		else
+			destroyFlyBodies()
+			showFlyButtons(false)
+			if hum then
+				hum.PlatformStand = flyWasPlatformStand or false
+				hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+			end
+			flyWasPlatformStand = nil
+		end
+		refresh()
+	end
+
+	function Mods.SetFlyValue(v)
+		values.fly = v
+	end
+
 	function Mods.Pause(on)
 		pauseCount = math.max(0, pauseCount + (on and 1 or -1))
 		if pauseCount == 0 then
@@ -2047,6 +2261,7 @@ do
 		Mods.SetWalk(false)
 		Mods.SetJump(false)
 		Mods.SetAntiFling(false)
+		Mods.SetFly(false)
 	end
 end
 
@@ -6068,30 +6283,6 @@ toolsTab:Button("Clear loadlogger", function(lbl)
 	flashLabel(lbl, "Cleared")
 end)
 
-toolsTab:Section("ESP")
-toolsTab:Label("Outlines and labels are coloured by each player's assigned team (white if they have none).")
-toolsTab:Toggle("ESP", false, function(state)
-	ESP.SetEnabled(state)
-end, "esp.enabled")
-toolsTab:Toggle("Show names", true, function(state)
-	ESP.SetNames(state)
-end, "esp.names")
-toolsTab:Choice("Name type", { "Display name", "Username" }, "Display name", function(name)
-	ESP.SetNameType(name)
-end, "esp.nameType")
-toolsTab:Choice("ESP style", { "Hitbox", "Full outline" }, "Full outline", function(name)
-	ESP.SetStyle(name)
-end, "esp.style")
-toolsTab:Toggle("Show team name", false, function(state)
-	ESP.SetTeamName(state)
-end, "esp.teamName")
-
-toolsTab:Section("Health meter")
-toolsTab:Label("Shows a health bar under every player. Works on its own, ESP doesn't need to be on.")
-toolsTab:Toggle("Health meter", false, function(state)
-	ESP.SetHealth(state)
-end, "esp.health")
-
 ---------------------------------------------------------------------
 -- Player tab
 ---------------------------------------------------------------------
@@ -6126,24 +6317,67 @@ task.spawn(function()
 	end
 end)
 
-playerTab:Section("Movement")
-playerTab:Toggle("Custom walkspeed", false, function(state)
+---------------------------------------------------------------------
+-- Physics tab (movement, fly, noclip, anti-fling)
+---------------------------------------------------------------------
+local physicsTab = addTab("Physics")
+physicsTab:Section("Movement")
+physicsTab:Toggle("Custom walkspeed", false, function(state)
 	Mods.SetWalk(state)
 end, "move.walk")
-playerTab:Slider("WalkSpeed", 0, 200, 16, function(v)
+physicsTab:Input("WalkSpeed", 16, function(v)
 	Mods.SetWalkValue(v)
-end, "move.walkValue")
-playerTab:Toggle("Custom jump power", false, function(state)
+end, "move.walkValue", 0, 10000)
+physicsTab:Toggle("Custom jump power", false, function(state)
 	Mods.SetJump(state)
 end, "move.jump")
-playerTab:Slider("JumpPower", 0, 300, 50, function(v)
+physicsTab:Input("JumpPower", 50, function(v)
 	Mods.SetJumpValue(v)
-end, "move.jumpValue")
+end, "move.jumpValue", 0, 10000)
 
-playerTab:Section("Protection")
-playerTab:Toggle("Anti-fling", false, function(state)
+physicsTab:Section("Fly")
+physicsTab:Toggle("Fly", false, function(state)
+	Mods.SetFly(state)
+end, "move.fly")
+physicsTab:Input("Fly speed", 60, function(v)
+	Mods.SetFlyValue(v)
+end, "move.flyValue", 0, 10000)
+physicsTab:Label("Fly moves you where the camera points. PC: WASD, Space to rise, LeftCtrl or Q to descend. Mobile: joystick plus the up and down buttons on the right of the screen.")
+
+-- (Noclip is added to this tab further down, next to its module)
+
+physicsTab:Section("Protection")
+physicsTab:Toggle("Anti-fling", false, function(state)
 	Mods.SetAntiFling(state)
 end, "protect.antifling")
+
+---------------------------------------------------------------------
+-- Graphics tab (ESP, health meter)
+---------------------------------------------------------------------
+local graphicsTab = addTab("Graphics")
+graphicsTab:Section("ESP")
+graphicsTab:Label("Outlines and labels are coloured by each player's assigned team (white if they have none).")
+graphicsTab:Toggle("ESP", false, function(state)
+	ESP.SetEnabled(state)
+end, "esp.enabled")
+graphicsTab:Toggle("Show names", true, function(state)
+	ESP.SetNames(state)
+end, "esp.names")
+graphicsTab:Choice("Name type", { "Display name", "Username" }, "Display name", function(name)
+	ESP.SetNameType(name)
+end, "esp.nameType")
+graphicsTab:Choice("ESP style", { "Hitbox", "Full outline" }, "Full outline", function(name)
+	ESP.SetStyle(name)
+end, "esp.style")
+graphicsTab:Toggle("Show team name", false, function(state)
+	ESP.SetTeamName(state)
+end, "esp.teamName")
+
+graphicsTab:Section("Health meter")
+graphicsTab:Label("Shows a health bar under every player. Works on its own, ESP doesn't need to be on.")
+graphicsTab:Toggle("Health meter", false, function(state)
+	ESP.SetHealth(state)
+end, "esp.health")
 
 local worldTab = addTab("World")
 
@@ -6378,12 +6612,12 @@ do
 	end
 end
 
-utilityTab:Section("Noclip")
-utilityTab:DropToggle("Noclip", { "Norm NC", "Wall TP" }, function(option)
+physicsTab:Section("Noclip")
+physicsTab:DropToggle("Noclip", { "Norm NC", "Wall TP" }, function(option)
 	Noclip.Set(option)
 	notify(option and ("Noclip: " .. option) or "Noclip off", option and "success" or "info")
 end)
-utilityTab:Label("Norm NC turns your collisions off so you walk straight through walls. Wall TP keeps collisions and teleports you to the other side when you walk into a wall. Only one works at a time. Tap Noclip again to turn it off.")
+physicsTab:Label("Norm NC turns your collisions off so you walk straight through walls. Wall TP keeps collisions and teleports you to the other side when you walk into a wall. Only one works at a time. Tap Noclip again to turn it off.")
 
 ---------------------------------------------------------------------
 -- Backdoor scanner + payload arguments (lives in the Tools tab)

@@ -7988,6 +7988,463 @@ do
 	end
 end
 
+---------------------------------------------------------------------
+-- Execute tab (run your own code, with a built-in safety scanner)
+---------------------------------------------------------------------
+do
+	local executeTab = addTab("Execute")
+
+	local function hexOf(c)
+		return "#" .. c:ToHex()
+	end
+	local function has(low, text)
+		return string.find(low, text, 1, true) ~= nil
+	end
+	local function firstOf(low, list)
+		for _, t in ipairs(list) do
+			if has(low, t) then
+				return t
+			end
+		end
+		return nil
+	end
+
+	-----------------------------------------------------------------
+	-- Scanner: looks for things that can hurt your account or device.
+	-- It's a pattern check, not a guarantee. Hidden or brand new tricks can slip past it.
+	-----------------------------------------------------------------
+	local function normalize(source)
+		local s = source
+		-- "ROBLO" .. "SECURITY" -> "ROBLOSECURITY"
+		s = s:gsub('"%s*%.%.%s*"', ""):gsub("'%s*%.%.%s*'", "")
+		-- \x41 and \065 style escapes -> real characters
+		s = s:gsub("\\x(%x%x)", function(h)
+			return string.char(tonumber(h, 16))
+		end)
+		s = s:gsub("\\(%d%d?%d?)", function(d)
+			local n = tonumber(d)
+			if n and n < 256 then
+				return string.char(n)
+			end
+		end)
+		-- string.char(72,105) -> "Hi"
+		s = s:gsub("string%.char%s*%(([%d%s,]+)%)", function(list)
+			local out = {}
+			for num in string.gmatch(list, "%d+") do
+				local n = tonumber(num)
+				if n and n < 256 then
+					table.insert(out, string.char(n))
+				end
+			end
+			return '"' .. table.concat(out) .. '"'
+		end)
+		return s
+	end
+
+	local SHORTENERS = { "bit.ly/", "tinyurl.com/", "t.co/", "cutt.ly/", "is.gd/", "rb.gy/", "shorturl.at/", "goo.gl/", "ow.ly/", "tiny.cc/", "lnkd.in/" }
+	local ANON_HOSTS = {
+		"pastebin.com", "hastebin", "paste.ee", "controlc.com", "ghostbin", "cdn.discordapp.com/attachments",
+		"media.discordapp.net/attachments", "ngrok", "trycloudflare.com", "duckdns.org", "anonfiles", "transfer.sh",
+		"mediafire.com", "mega.nz", "dropbox.com/s/",
+	}
+	local DANGEROUS_EXT = { ".exe", ".bat", ".cmd", ".ps1", ".vbs", ".scr", ".dll", ".lnk", ".msi", ".jar", ".apk", ".sh" }
+
+	local function scan(source)
+		local findings = {}
+		local function add(sev, title, why, found)
+			table.insert(findings, { sev = sev, title = title, why = why, found = found, order = #findings })
+		end
+
+		local text = normalize(source)
+		local low = string.lower(text)
+		local outbound = firstOf(low, { "httppost", "postasync", "requestasync", "http_request", "syn.request", "request(", "request (" })
+
+		-- account
+		local hit = firstOf(low, { "roblosecurity", "do-not-share-this" })
+		if hit then
+			add("high", "Reads your Roblox login cookie", "That cookie gives full access to your account. Normal scripts never need it.", hit)
+		end
+		hit = firstOf(low, {
+			"auth.roblox.com", "accountsettings.roblox.com", "economy.roblox.com/v1/purchases", "trades.roblox.com",
+			"billing.roblox.com", "twostepverification.roblox.com", "users.roblox.com/v1/users/authenticated",
+			"privatemessages.roblox.com", "accountinformation.roblox.com", "premiumfeatures.roblox.com", "/v2/logout",
+		})
+		if hit then
+			add("high", "Calls Roblox account APIs", "These are used to change account settings, spend Robux, trade items or read private info.", hit)
+		end
+		hit = firstOf(low, { "promptpurchase", "promptproductpurchase", "promptgamepasspurchase", "promptrobuxpurchase", "performpurchase", "promptbundlepurchase", "promptpremiumpurchase" })
+		if hit then
+			add("medium", "Tries to make you buy something", "Check carefully before you confirm any purchase pop-up.", hit)
+		end
+
+		-- data leaving your device
+		hit = firstOf(low, { "discord.com/api/webhooks", "discordapp.com/api/webhooks", "/api/webhooks/" })
+		if hit then
+			add("high", "Sends data to a Discord webhook", "Stolen info is often sent to the thief this way, and you'd never see it happen.", hit)
+		end
+		hit = firstOf(low, { "api.telegram.org/bot" })
+		if hit then
+			add("high", "Sends data to a Telegram bot", "Another common way to send stolen info out.", hit)
+		end
+		hit = firstOf(low, { "grabify", "iplogger", "2no.co", "yip.su", "blasze", "stopify.co", "leakix" })
+		if hit then
+			add("high", "Contains an IP logger link", "These links record the IP address of anyone who opens them.", hit)
+		end
+		hit = firstOf(low, { "ipify.org", "ip-api.com", "ipinfo.io", "ifconfig.me", "icanhazip", "checkip.", "whatismyip", "myexternalip", "ipapi.co", "geoiplookup" })
+		if hit then
+			add("medium", "Looks up your IP address", "Sometimes harmless, but it's also how scripts learn where you are.", hit)
+		end
+		hit = firstOf(low, { "gethwid", "get_hwid", "hwid", "getclientid", "rbxanalyticsservice" })
+		if hit then
+			add(outbound and "high" or "medium", outbound and "Reads your device ID and can send data online" or "Reads a device ID",
+				"A device ID identifies your computer or phone, and can be used to track or ban it.", hit)
+		end
+		if outbound then
+			hit = firstOf(low, { "userid", "accountage", "membershiptype" })
+			if hit then
+				add("medium", "Can send your account info online", "It reads account details and has a way to send data out.", hit)
+			end
+			hit = firstOf(low, { "chatted", "onincomingmessage", "messagereceived" })
+			if hit then
+				add("medium", "Can send your chat messages online", "It reads chat and has a way to send data out.", hit)
+			end
+		end
+
+		-- device
+		hit = firstOf(low, { "os.execute", "io.popen", "cmd.exe", "powershell", "/bin/sh", "/bin/bash", "wscript.shell", "mshta", "rundll32", "certutil", "schtasks" })
+		if hit then
+			add("high", "Tries to run system commands", "That would let a script control your computer outside of Roblox.", hit)
+		end
+		if has(low, "writefile") or has(low, "appendfile") then
+			for _, ext in ipairs(DANGEROUS_EXT) do
+				if has(low, ext .. '"') or has(low, ext .. "'") then
+					add("high", "Writes a program file to your device", "Saving files like " .. ext .. " is how malware gets onto a device.", ext)
+					break
+				end
+			end
+		end
+		if has(low, "setclipboard") or has(low, "toclipboard") then
+			local wallet
+			for run in string.gmatch(low, "bc1[%w]+") do
+				if #run >= 26 then
+					wallet = run
+					break
+				end
+			end
+			wallet = wallet or string.match(low, "0x" .. string.rep("%x", 40))
+			if wallet then
+				add("high", "Swaps your clipboard for a wallet address", "This can redirect money you meant to send to someone else.", string.sub(wallet, 1, 14) .. "...")
+			end
+		end
+		hit = firstOf(low, { "delfile", "delfolder" })
+		if hit then
+			add("medium", "Deletes files", "It can erase your saved scripts and settings in the executor folder.", hit)
+		end
+		if string.find(low, "while%s+true%s+do%s*end") or string.find(low, "repeat%s*until%s+false") or has(low, "game:shutdown")
+			or string.find(low, "string%.rep%s*%(.-,%s*%d%d%d%d%d%d%d+") then
+			add("medium", "Could freeze or close the game", "It has an endless loop with no wait, a huge allocation, or a shutdown call.")
+		end
+
+		-- remote code and links
+		if has(low, "loadstring") and (has(low, "httpget") or has(low, "http.request") or has(low, "request(") or has(low, "getasync")) then
+			add("medium", "Downloads and runs code from the internet", "That code isn't in this script, so it can't be scanned here, and it can change later. Only run it if you trust the link.")
+		end
+		local urls, seen = {}, {}
+		for url in string.gmatch(text, "https?://[%w%-%._~:/%?#@!$&%(%)%*%+,;=%%]+") do
+			if not seen[url] then
+				seen[url] = true
+				table.insert(urls, url)
+			end
+		end
+		for _, url in ipairs(urls) do
+			local u = string.lower(url)
+			local why = firstOf(u, SHORTENERS) and "a link shortener (hides where it really goes)"
+				or string.match(u, "^https?://%d+%.%d+%.%d+%.%d+") and "a raw IP address instead of a website name"
+				or firstOf(u, ANON_HOSTS) and "a site where anyone can host anything"
+			if why then
+				add("medium", "Suspicious link", "It points to " .. why .. ".", string.sub(url, 1, 60))
+				break
+			end
+		end
+		if #urls > 0 then
+			local shown = {}
+			for i = 1, math.min(#urls, 4) do
+				table.insert(shown, string.sub(urls[i], 1, 60))
+			end
+			add("low", "Contains links", "Check that you recognise these.", table.concat(shown, "\n"))
+		end
+
+		-- hard to read
+		local escapes = select(2, string.gsub(source, "\\%d%d%d", "")) + select(2, string.gsub(source, "\\x%x%x", ""))
+		local hidden = firstOf(string.lower(source), { "luraph", "moonsec", "ironbrew", "obfuscat" })
+		local blob = false
+		for run in string.gmatch(source, "[%w%+/=]+") do
+			if #run >= 300 then
+				blob = true
+				break
+			end
+		end
+		local longLine = false
+		for line in string.gmatch(source, "[^\n]+") do
+			if #line > 3000 then
+				longLine = true
+				break
+			end
+		end
+		if hidden or escapes >= 40 or blob or longLine then
+			add("medium", "Hard to read on purpose", "Hidden or scrambled code can't be checked reliably, so something dangerous could be inside.")
+		end
+
+		-- low-level hooks (info only)
+		hit = firstOf(low, { "hookmetamethod", "hookfunction", "getrawmetatable", "setreadonly" })
+		if hit then
+			add("low", "Uses low-level hooks", "Common in cheats and tools. They can watch or change what the game does.", hit)
+		end
+		if has(low, "teleportservice") and (has(low, "teleportasync") or has(low, ":teleport(")) then
+			add("low", "Can teleport you to another place", "Make sure you're okay with being moved.")
+		end
+
+		local rank = { high = 1, medium = 2, low = 3 }
+		table.sort(findings, function(a, b)
+			if rank[a.sev] ~= rank[b.sev] then
+				return rank[a.sev] < rank[b.sev]
+			end
+			return a.order < b.order
+		end)
+		return findings
+	end
+
+	local function describe(source)
+		local findings = scan(source)
+		local high, med = 0, 0
+		for _, f in ipairs(findings) do
+			if f.sev == "high" then
+				high += 1
+			elseif f.sev == "medium" then
+				med += 1
+			end
+		end
+		local verdict, color, kind
+		if high > 0 then
+			verdict, color, kind = "Dangerous. Don't run this.", theme.red, "error"
+		elseif med >= 2 then
+			verdict, color, kind = "Suspicious. Be careful.", theme.amber, "warn"
+		elseif med == 1 then
+			verdict, color, kind = "Use caution.", theme.amber, "warn"
+		else
+			verdict, color, kind = "No known threats found.", toastColors.success, "success"
+		end
+		local sevColor = { high = hexOf(theme.red), medium = hexOf(theme.amber), low = hexOf(theme.dim) }
+		local dim = hexOf(theme.dim)
+		local lines = { '<font color="' .. hexOf(color) .. '"><b>' .. verdict .. "</b></font>" }
+		for i, f in ipairs(findings) do
+			if i > 8 then
+				table.insert(lines, '<font color="' .. dim .. '">...and ' .. (#findings - 8) .. " more.</font>")
+				break
+			end
+			local entry = '<font color="' .. sevColor[f.sev] .. '"><b>' .. string.upper(f.sev) .. "</b></font>  <b>" .. escapeRich(f.title) .. "</b>"
+				.. '\n<font color="' .. dim .. '">' .. escapeRich(f.why)
+			if f.found then
+				entry ..= "\nfound: " .. escapeRich(f.found)
+			end
+			table.insert(lines, entry .. "</font>")
+		end
+		table.insert(lines, '<font color="' .. dim .. '">Scanned ' .. #source .. " characters. A scan can't catch everything, so only run scripts you trust.</font>")
+		return table.concat(lines, "\n\n"), high, verdict, kind
+	end
+
+	-----------------------------------------------------------------
+	-- Editor
+	-----------------------------------------------------------------
+	executeTab:Section("Script")
+	local editorBox = executeTab:Container(150)
+	local editor = new("ScrollingFrame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = theme.bg,
+		BackgroundTransparency = 0.3,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = theme.accent,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+	}, editorBox)
+	corner(editor, 8)
+	stroke(editor, 0.9)
+	local codeBox = new("TextBox", {
+		Text = "",
+		PlaceholderText = "-- Type or paste your script here",
+		PlaceholderColor3 = theme.dim,
+		ClearTextOnFocus = false,
+		MultiLine = true,
+		TextWrapped = true,
+		Font = Enum.Font.Code,
+		TextSize = 12,
+		TextColor3 = theme.text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 150),
+		AutomaticSize = Enum.AutomaticSize.Y,
+	}, editor)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6) }, codeBox)
+
+	-----------------------------------------------------------------
+	-- Buttons: Execute, Clear, Paste, Copy, Scan
+	-----------------------------------------------------------------
+	local buttonRow = executeTab:Container(34)
+	new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, buttonRow)
+
+	local function makeButton(text, order, primary, callback)
+		local b = new("TextButton", {
+			Text = text,
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextScaled = true,
+			TextColor3 = theme.text,
+			AutoButtonColor = false,
+			BackgroundColor3 = primary and theme.accent or theme.surface,
+			BackgroundTransparency = primary and 0.1 or 0.35,
+			BorderSizePixel = 0,
+			Size = UDim2.new(0.2, -4, 1, 0),
+			LayoutOrder = order,
+		}, buttonRow)
+		corner(b, 8)
+		stroke(b, 0.94)
+		new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 8 }, b)
+		new("UIPadding", { PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 3) }, b)
+		local base = primary and 0.1 or 0.35
+		connect(b.MouseEnter, function()
+			tween(b, 0.15, { BackgroundTransparency = math.max(base - 0.2, 0) })
+		end)
+		connect(b.MouseLeave, function()
+			tween(b, 0.15, { BackgroundTransparency = base })
+		end)
+		connect(b.Activated, function()
+			task.spawn(callback)
+		end)
+		return b
+	end
+
+	executeTab:Section("Result")
+	local resultLabel = executeTab:Label("Nothing yet. Tap Scan to check a script before you run it.")
+	resultLabel.RichText = true
+	local function setResult(text)
+		resultLabel.Text = text
+		resultLabel.TextColor3 = theme.text
+	end
+
+	local function runCode(source)
+		if typeof(loadstring) ~= "function" then
+			notify("Your executor has no loadstring", "error")
+			return
+		end
+		local fn, err = loadstring(source)
+		if not fn then
+			setResult('<font color="' .. hexOf(theme.red) .. '"><b>Syntax error</b></font>\n' .. escapeRich(tostring(err)))
+			notify("Syntax error. See the Execute tab.", "error", 3)
+			return
+		end
+		setResult("Script is running.")
+		notify("Running script", "success")
+		task.spawn(function()
+			local ok, runErr = pcall(fn)
+			if not ok then
+				warn("[Toolx] Execute errored: " .. tostring(runErr))
+				setResult('<font color="' .. hexOf(theme.red) .. '"><b>Script errored</b></font>\n' .. escapeRich(tostring(runErr)))
+				notify("Script errored (see console)", "error", 3)
+			end
+		end)
+	end
+
+	local pendingUntil = 0
+	local executeBtn
+	local function resetExecute()
+		pendingUntil = 0
+		if executeBtn then
+			executeBtn.Text = "Execute"
+		end
+	end
+
+	executeBtn = makeButton("Execute", 1, true, function()
+		local source = codeBox.Text
+		if string.match(source, "^%s*$") then
+			notify("Nothing to run", "warn")
+			return
+		end
+		local report, high = describe(source)
+		if high > 0 and os.clock() > pendingUntil then
+			-- dangerous findings: show them and ask for a second tap
+			setResult(report)
+			pendingUntil = os.clock() + 8
+			executeBtn.Text = "Run anyway?"
+			notify("Dangerous findings. Tap again to run anyway.", "error", 4)
+			task.delay(8, function()
+				if executeBtn.Parent and os.clock() >= pendingUntil then
+					executeBtn.Text = "Execute"
+				end
+			end)
+			return
+		end
+		resetExecute()
+		runCode(source)
+	end)
+
+	makeButton("Clear", 2, false, function()
+		codeBox.Text = ""
+		setResult("Cleared.")
+		resetExecute()
+	end)
+
+	makeButton("Paste", 3, false, function()
+		local reader = (typeof(getclipboard) == "function" and getclipboard)
+			or (typeof(fromclipboard) == "function" and fromclipboard)
+			or (typeof(readclipboard) == "function" and readclipboard)
+		if not reader then
+			notify("Your executor can't read the clipboard. Long-press the box to paste.", "warn", 4)
+			return
+		end
+		local ok, clip = pcall(reader)
+		if not ok or typeof(clip) ~= "string" or clip == "" then
+			notify("Clipboard is empty", "warn")
+			return
+		end
+		local current = codeBox.Text
+		if current ~= "" and string.sub(current, -1) ~= "\n" then
+			current ..= "\n"
+		end
+		codeBox.Text = current .. clip
+		notify("Pasted", "success")
+	end)
+
+	makeButton("Copy", 4, false, function()
+		if codeBox.Text == "" then
+			notify("Nothing to copy", "warn")
+			return
+		end
+		if copyToClipboard(codeBox.Text) then
+			notify("Copied", "success")
+		else
+			notify("Your executor can't set the clipboard", "error")
+		end
+	end)
+
+	makeButton("Scan", 5, false, function()
+		local source = codeBox.Text
+		if string.match(source, "^%s*$") then
+			notify("Nothing to scan", "warn")
+			return
+		end
+		local report, _, verdict, kind = describe(source)
+		setResult(report)
+		notify("Scan: " .. verdict, kind, 3)
+	end)
+
+	connect(codeBox:GetPropertyChangedSignal("Text"), resetExecute)
+
+	executeTab:Label("Paste adds the clipboard to the end of your script. Execute scans first and asks you to tap again if it finds something dangerous.")
+end
+
 local toolsTab = addTab("Tools")
 toolsTab:Section("Console")
 toolsTab:Button("Open console", function(lbl)

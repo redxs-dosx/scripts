@@ -44,7 +44,9 @@ end)
 local theme = {
 	bg = Color3.fromRGB(16, 16, 22),
 	surface = Color3.fromRGB(34, 34, 46),
-	accent = Color3.fromRGB(108, 128, 255),
+	accent = Color3.fromRGB(255, 122, 24), -- Spooky Mode (default); switches to accentDefault when off
+	accentSpooky = Color3.fromRGB(255, 122, 24),
+	accentDefault = Color3.fromRGB(108, 128, 255),
 	text = Color3.fromRGB(236, 236, 246),
 	dim = Color3.fromRGB(144, 144, 166),
 	off = Color3.fromRGB(58, 58, 74),
@@ -52,6 +54,10 @@ local theme = {
 	amber = Color3.fromRGB(242, 178, 60),
 	white = Color3.new(1, 1, 1),
 }
+
+local function accentHex()
+	return "#" .. theme.accent:ToHex()
+end
 
 local BLUR_SIZE = 14
 local SIDEBAR_W = 108
@@ -750,8 +756,18 @@ local dot = new("Frame", {
 }, titleBar)
 corner(dot, 4)
 
--- Logo (downloaded once, falls back to the dot if the executor can't do it)
-local LOGO_URL = "https://raw.githubusercontent.com/redxs-dosx/scripts/cf91929ea86af4df0e974cdfbfbf9192b9fdf8ec/logo.png"
+-- Logo (downloaded once per variant, falls back to the dot if the executor can't do it)
+local LOGO = {
+	urls = {
+		normal = "https://raw.githubusercontent.com/redxs-dosx/scripts/cf91929ea86af4df0e974cdfbfbf9192b9fdf8ec/logo.png",
+		-- not pinned to a commit like the normal logo; replace "main" with a commit hash to pin it
+		spooky = "https://raw.githubusercontent.com/redxs-dosx/scripts/main/logohalloween.png",
+	},
+	files = { normal = "Toolx/logo.png", spooky = "Toolx/logohalloween.png" },
+	assets = {},
+	busy = {},
+	wanted = "spooky",
+}
 local logo = new("ImageLabel", {
 	Name = "Logo",
 	Size = UDim2.fromOffset(24, 24),
@@ -760,31 +776,103 @@ local logo = new("ImageLabel", {
 	ScaleType = Enum.ScaleType.Fit,
 	Visible = false,
 }, titleBar)
-task.spawn(function()
-	local ok, err = pcall(function()
-		local getAsset = getcustomasset or getsynasset
-		if not (getAsset and writefile and game.HttpGet) then
-			error("executor lacks getcustomasset/writefile/HttpGet")
-		end
-		local data = game:HttpGet(LOGO_URL)
-		if typeof(data) ~= "string" or #data == 0 then
-			error("empty download")
-		end
-		pcall(function()
-			if makefolder and isfolder and not isfolder("Toolx") then
-				makefolder("Toolx")
-			end
-		end)
-		local path = "Toolx/logo.png"
-		writefile(path, data)
-		logo.Image = getAsset(path)
+
+local function showLogo(kind)
+	if LOGO.wanted == kind and LOGO.assets[kind] then
+		logo.Image = LOGO.assets[kind]
 		logo.Visible = true
 		dot.Visible = false
-	end)
-	if not ok then
-		warn("[Toolx] logo failed to load: " .. tostring(err))
 	end
-end)
+end
+
+local function setLogo(kind)
+	LOGO.wanted = kind
+	if LOGO.assets[kind] then
+		showLogo(kind)
+		return
+	end
+	if LOGO.busy[kind] then
+		return
+	end
+	LOGO.busy[kind] = true
+	task.spawn(function()
+		local ok, err = pcall(function()
+			local getAsset = getcustomasset or getsynasset
+			if not (getAsset and writefile and game.HttpGet) then
+				error("executor lacks getcustomasset/writefile/HttpGet")
+			end
+			local data = game:HttpGet(LOGO.urls[kind])
+			if typeof(data) ~= "string" or #data == 0 then
+				error("empty download")
+			end
+			pcall(function()
+				if makefolder and isfolder and not isfolder("Toolx") then
+					makefolder("Toolx")
+				end
+			end)
+			writefile(LOGO.files[kind], data)
+			LOGO.assets[kind] = getAsset(LOGO.files[kind])
+		end)
+		LOGO.busy[kind] = false
+		if ok then
+			showLogo(kind)
+		else
+			warn("[Toolx] " .. kind .. " logo failed to load: " .. tostring(err))
+			-- never leave the title bar without a logo: fall back to the normal one
+			if kind == "spooky" and LOGO.wanted == "spooky" then
+				setLogo("normal")
+			end
+		end
+	end)
+end
+setLogo("spooky")
+
+-- Spooky Mode: recolors the whole gui between the Halloween orange and the normal blue
+local Spooky = { on = true }
+local function sameColor(a, b)
+	return math.abs(a.R - b.R) < 0.004 and math.abs(a.G - b.G) < 0.004 and math.abs(a.B - b.B) < 0.004
+end
+
+function Spooky.apply(on)
+	Spooky.on = on
+	local from, to = theme.accent, on and theme.accentSpooky or theme.accentDefault
+	if not sameColor(from, to) then
+		local oldHex, newHex = from:ToHex(), to:ToHex()
+		theme.accent = to
+		toastColors.info = to
+		for _, d in ipairs(gui:GetDescendants()) do
+			if d:IsA("GuiObject") then
+				if sameColor(d.BackgroundColor3, from) then
+					d.BackgroundColor3 = to
+				end
+				if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+					if sameColor(d.TextColor3, from) then
+						d.TextColor3 = to
+					end
+					if d.RichText and string.find(d.Text, oldHex, 1, true) then
+						d.Text = (string.gsub(d.Text, oldHex, newHex))
+					end
+				elseif d:IsA("ImageLabel") or d:IsA("ImageButton") then
+					if sameColor(d.ImageColor3, from) then
+						d.ImageColor3 = to
+					end
+				elseif d:IsA("ScrollingFrame") then
+					if sameColor(d.ScrollBarImageColor3, from) then
+						d.ScrollBarImageColor3 = to
+					end
+				end
+			elseif d:IsA("UIStroke") then
+				if sameColor(d.Color, from) then
+					d.Color = to
+				end
+			end
+		end
+	end
+	setLogo(on and "spooky" or "normal")
+	if Spooky.banner then
+		Spooky.banner.Visible = on
+	end
+end
 
 new("TextLabel", {
 	Text = 'Toolx  <font size="11" color="#9090a6">v' .. VERSION .. "</font>",
@@ -6181,6 +6269,23 @@ do
 	end
 
 	-----------------------------------------------------------------
+	-- Halloween banner (only while Spooky Mode is on)
+	-----------------------------------------------------------------
+	do
+		local bannerBox = mainTab:Container(28)
+		new("TextLabel", {
+			Text = "Happy Spooktober!",
+			Font = Enum.Font.GothamBold,
+			TextSize = 18,
+			TextColor3 = theme.accent,
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+		}, bannerBox)
+		bannerBox.Visible = Spooky.on
+		Spooky.banner = bannerBox
+	end
+
+	-----------------------------------------------------------------
 	-- Profile header
 	-----------------------------------------------------------------
 	local headerBox = mainTab:Container(72)
@@ -6531,7 +6636,7 @@ do
 	  end
 	  for i, u in ipairs(P.users) do
 	    new("TextLabel", {
-	      Text = u.display .. "  <font color=\"#9090a6\">@" .. u.name .. "</font>" .. (u.me and "  <font color=\"#6c80ff\">you</font>" or ""),
+	      Text = u.display .. "  <font color=\"#9090a6\">@" .. u.name .. "</font>" .. (u.me and ("  <font color=\"" .. accentHex() .. "\">you</font>") or ""),
 	      RichText = true,
 	      Font = Enum.Font.GothamMedium,
 	      TextSize = 12,
@@ -8112,7 +8217,7 @@ local function paintSelection()
 	for p, entry in pairs(playerLines) do
 		if entry.label.Parent then
 			entry.label.Text = (p == selectedPlayer)
-				and ('<font color="#6c80ff"><b>\u{25B6}</b></font> <b>' .. entry.text .. "</b>")
+				and ('<font color="' .. accentHex() .. '"><b>\u{25B6}</b></font> <b>' .. entry.text .. "</b>")
 				or entry.text
 		end
 	end
@@ -8348,7 +8453,7 @@ do
 
 	local function kindTag(kind)
 		if kind == "preset" then
-			return ' <font color="#6c80ff">[preset]</font>'
+			return ' <font color="' .. accentHex() .. '">[preset]</font>'
 		elseif kind == "auto" then
 			return ' <font color="#f2b23c">[scanned]</font>'
 		end
@@ -8368,7 +8473,7 @@ do
 				refreshLocs()
 			end)
 			if selectedLoc == loc then
-				label.Text = '<font color="#6c80ff"><b>\u{25B6}</b></font> <b>' .. escapeRich(loc.name) .. "</b>" .. ' <font color="#9090a6">' .. string.format("%.0f, %.0f, %.0f", loc.x, loc.y, loc.z) .. "</font>"
+				label.Text = '<font color="' .. accentHex() .. '"><b>\u{25B6}</b></font> <b>' .. escapeRich(loc.name) .. "</b>" .. ' <font color="#9090a6">' .. string.format("%.0f, %.0f, %.0f", loc.x, loc.y, loc.z) .. "</font>"
 			end
 		end
 	end
@@ -8394,7 +8499,7 @@ do
 				refreshMaps()
 			end)
 			if selectedMap == m then
-				label.Text = '<font color="#6c80ff"><b>\u{25B6}</b></font> <b>' .. escapeRich(m.name) .. "</b>" .. kindTag(m.kind)
+				label.Text = '<font color="' .. accentHex() .. '"><b>\u{25B6}</b></font> <b>' .. escapeRich(m.name) .. "</b>" .. kindTag(m.kind)
 			end
 		end
 		mapNote.Text = selectedMap and ("Selected map: " .. selectedMap.name .. ". Tap a location, then Teleport.")
@@ -9004,6 +9109,10 @@ settingsTab:Toggle("Notifications", true, function(state)
 		notify("Notifications on", "success")
 	end
 end, "ui.notifications")
+settingsTab:Toggle("Spooky Mode", true, function(state)
+	Spooky.apply(state)
+end, "ui.spooky")
+settingsTab:Label("Halloween theme: orange colors, the Halloween logo and the Happy Spooktober! banner on Main.")
 settingsTab:Keybind("Toggle key", "RightShift", function(name)
 	toggleKey = name ~= "None" and Enum.KeyCode[name] or nil
 	notify("Toggle key: " .. name)

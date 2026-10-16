@@ -8263,10 +8263,16 @@ do
 		BackgroundColor3 = theme.bg,
 		BackgroundTransparency = 0.3,
 		BorderSizePixel = 0,
-		ScrollBarThickness = 3,
+		ScrollBarThickness = 6,
 		ScrollBarImageColor3 = theme.accent,
+		ScrollBarImageTransparency = 0.1,
+		VerticalScrollBarInset = Enum.ScrollBarInset.Always,
+		VerticalScrollBarPosition = Enum.VerticalScrollBarPosition.Right,
+		ElasticBehavior = Enum.ElasticBehavior.Never,
+		Active = true,
+		-- the canvas height is managed by hand (see the editor helpers below) so the scrollbar always matches the text
 		CanvasSize = UDim2.new(),
-		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		AutomaticCanvasSize = Enum.AutomaticSize.None,
 		ScrollingDirection = Enum.ScrollingDirection.Y,
 	}, editorBox)
 	corner(editor, 8)
@@ -8285,9 +8291,314 @@ do
 		TextYAlignment = Enum.TextYAlignment.Top,
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 150),
-		AutomaticSize = Enum.AutomaticSize.Y,
 	}, editor)
 	new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6) }, codeBox)
+
+	-- Luau syntax highlighting + scrolling for the editor (wrapped in a function so it adds no locals to the script's top level)
+	;(function()
+		local TextService = game:GetService("TextService")
+		local EDITOR_FONT, EDITOR_SIZE = Enum.Font.Code, 12
+		local PAD_X, PAD_Y = 8, 6
+
+		-----------------------------------------------------------------
+		-- Syntax highlighting: the TextBox's own text is made invisible and a RichText label
+		-- with identical font / size / wrapping is drawn exactly on top of it, so the cursor,
+		-- selection and keyboard all still belong to the real TextBox.
+		-----------------------------------------------------------------
+		local function makeHighlighter()
+			local function set(list)
+				local s = {}
+				for w in string.gmatch(list, "%S+") do
+					s[w] = true
+				end
+				return s
+			end
+
+			local KEYWORDS = set("and break continue do else elseif end export for function goto if in local not or repeat return then until while self")
+			local CONSTANTS = set("nil true false")
+			local BUILTINS = set([[
+				print warn error assert pcall xpcall select type typeof tostring tonumber pairs ipairs next rawget rawset rawequal rawlen
+				setmetatable getmetatable require loadstring newproxy unpack tick time wait spawn delay game workspace script shared plugin
+				_G _VERSION math string table task os coroutine utf8 bit32 buffer debug Instance Vector2 Vector3 Vector2int16 Vector3int16
+				CFrame Color3 BrickColor UDim UDim2 Enum Ray Rect Region3 TweenInfo NumberRange NumberSequence ColorSequence
+				Random Font DateTime Axes Faces OverlapParams RaycastParams PhysicalProperties
+				getgenv getrenv getfenv setfenv getreg getgc getinstances getnilinstances getscripts getloadedmodules getconnections
+				hookfunction hookmetamethod getrawmetatable setrawmetatable setreadonly isreadonly checkcaller newcclosure islclosure iscclosure
+				clonefunction cloneref compareinstances firesignal fireclickdetector fireproximityprompt firetouchinterest
+				request http_request identifyexecutor gethui setclipboard getclipboard writefile readfile isfile isfolder makefolder
+				delfile delfolder listfiles appendfile loadfile dofile getcustomasset queue_on_teleport setfpscap getnamecallmethod
+				setnamecallmethod getcallingscript decompile getsenv getrenv Drawing WebSocket
+			]])
+
+			local C_KEYWORD = "#F86D7C"
+			local C_CONST = "#FFC600"
+			local C_NUMBER = "#FFC600"
+			local C_STRING = "#ADF195"
+			local C_COMMENT = "#6C7086"
+			local C_BUILTIN = "#84D6F7"
+			local C_FUNC = "#FDFBAC"
+
+			local ESC = { ["&"] = "&amp;", ["<"] = "&lt;", [">"] = "&gt;", ['"'] = "&quot;", ["'"] = "&apos;" }
+			local function esc(s)
+				return (string.gsub(s, "[&<>\"']", ESC))
+			end
+
+			return function(src)
+				local out, n = {}, 0
+				local function emit(text, color)
+					n = n + 1
+					if color then
+						out[n] = '<font color="' .. color .. '">' .. esc(text) .. "</font>"
+					else
+						out[n] = esc(text)
+					end
+				end
+
+				local len = #src
+				local i = 1
+				while i <= len do
+					local b = string.byte(src, i)
+					local nextI
+
+					if b == 45 and string.byte(src, i + 1) == 45 then
+						-- comment: --[[ ]] / --[=[ ]=] or to end of line
+						local eq = string.match(src, "^%-%-%[(=*)%[", i)
+						if eq then
+							local _, close = string.find(src, "]" .. eq .. "]", i + 4 + #eq, true)
+							nextI = (close or len) + 1
+						else
+							local nl = string.find(src, "\n", i, true)
+							nextI = nl or (len + 1)
+						end
+						emit(string.sub(src, i, nextI - 1), C_COMMENT)
+					elseif b == 34 or b == 39 then
+						-- "string" / 'string' (ends at the closing quote or at the end of the line)
+						local j = i + 1
+						while j <= len do
+							local c = string.byte(src, j)
+							if c == 92 then
+								j = j + 2
+							elseif c == b then
+								break
+							elseif c == 10 then
+								j = j - 1
+								break
+							else
+								j = j + 1
+							end
+						end
+						if j > len then
+							j = len
+						end
+						nextI = j + 1
+						emit(string.sub(src, i, j), C_STRING)
+					elseif b == 96 then
+						-- `interpolated string` (may span lines)
+						local j = i + 1
+						while j <= len do
+							local c = string.byte(src, j)
+							if c == 92 then
+								j = j + 2
+							elseif c == 96 then
+								break
+							else
+								j = j + 1
+							end
+						end
+						if j > len then
+							j = len
+						end
+						nextI = j + 1
+						emit(string.sub(src, i, j), C_STRING)
+					elseif b == 91 and string.match(src, "^%[=*%[", i) then
+						-- [[ long string ]]
+						local eq = string.match(src, "^%[(=*)%[", i)
+						local _, close = string.find(src, "]" .. eq .. "]", i + 2 + #eq, true)
+						nextI = (close or len) + 1
+						emit(string.sub(src, i, nextI - 1), C_STRING)
+					elseif (b >= 48 and b <= 57) or (b == 46 and (string.byte(src, i + 1) or 0) >= 48 and (string.byte(src, i + 1) or 0) <= 57 and string.byte(src, i - 1) ~= 46) then
+						-- number
+						local s = string.match(src, "^0[xX][%x_]+", i) or string.match(src, "^0[bB][01_]+", i)
+						if not s then
+							s = string.match(src, "^[%d_]*%.?[%d_]*", i)
+							local e = string.match(src, "^[eE][+-]?%d+", i + #s)
+							if e then
+								s = s .. e
+							end
+						end
+						nextI = i + #s
+						emit(s, C_NUMBER)
+					elseif (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95 then
+						-- identifier / keyword
+						local word = string.match(src, "^[%w_]+", i)
+						nextI = i + #word
+						local before = string.byte(src, i - 1)
+						local isMember = (before == 46 and string.byte(src, i - 2) ~= 46) or before == 58
+						local after = string.match(src, "^%s*([%(\"'{`])", nextI)
+						local color
+						if isMember then
+							if after then
+								color = C_FUNC
+							end
+						elseif KEYWORDS[word] then
+							color = C_KEYWORD
+						elseif CONSTANTS[word] then
+							color = C_CONST
+						elseif BUILTINS[word] then
+							color = C_BUILTIN
+						elseif after == "(" then
+							color = C_FUNC
+						end
+						emit(word, color)
+						if word == "function" and not isMember then
+							-- "function a.b:c(" : color the whole name
+							local ws, name = string.match(src, "^(%s+)([%a_][%w_%.:]*)", nextI)
+							if name then
+								emit(ws)
+								emit(name, C_FUNC)
+								nextI = nextI + #ws + #name
+							end
+						end
+					elseif b == 64 then
+						-- @attribute
+						local word = string.match(src, "^@[%w_]+", i) or "@"
+						nextI = i + #word
+						emit(word, C_KEYWORD)
+					else
+						-- whitespace / punctuation: plain, grabbed in runs
+						local run = string.match(src, "^[^%w_\"'`%[%-@%.]+", i)
+						if not run or #run == 0 then
+							run = string.sub(src, i, i)
+						end
+						nextI = i + #run
+						emit(run)
+					end
+
+					i = nextI
+				end
+				return table.concat(out)
+			end
+		end
+
+		local highlight = makeHighlighter()
+		local overlay = new("TextLabel", {
+			Name = "Syntax",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Text = "",
+			RichText = true,
+			Font = EDITOR_FONT,
+			TextSize = EDITOR_SIZE,
+			TextWrapped = true,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			Active = false,
+			ZIndex = 3,
+		}, codeBox)
+
+		local MAX_HIGHLIGHT = 20000 -- past this the rich text gets slow, so show plain text instead
+		local function refreshHighlight()
+			local src = codeBox.Text
+			if src == "" or #src > MAX_HIGHLIGHT then
+				overlay.Text = ""
+				codeBox.TextTransparency = 0
+				return
+			end
+			local ok, rich = pcall(highlight, src)
+			if ok and type(rich) == "string" then
+				overlay.Text = rich
+				codeBox.TextTransparency = 1
+			else
+				overlay.Text = ""
+				codeBox.TextTransparency = 0
+			end
+		end
+
+		-----------------------------------------------------------------
+		-- Scrolling: canvas height follows the text, the scrollbar is thicker,
+		-- touch-drag scrolls the editor, and typing keeps the cursor in view.
+		-----------------------------------------------------------------
+		local function relayout()
+			local viewH = editor.AbsoluteWindowSize.Y
+			local h = math.max(viewH, codeBox.TextBounds.Y + PAD_Y * 2 + 24)
+			codeBox.Size = UDim2.new(1, 0, 0, h)
+			editor.CanvasSize = UDim2.fromOffset(0, h)
+		end
+
+		local function maxScroll()
+			return math.max(0, editor.CanvasSize.Y.Offset - editor.AbsoluteWindowSize.Y)
+		end
+
+		local function scrollTo(y)
+			editor.CanvasPosition = Vector2.new(0, math.clamp(y, 0, maxScroll()))
+		end
+
+		local function followCursor()
+			if not codeBox:IsFocused() then
+				return
+			end
+			local text = codeBox.Text
+			local cursor = codeBox.CursorPosition
+			if cursor < 1 or #text > 30000 then
+				return
+			end
+			local ok, size = pcall(function()
+				return TextService:GetTextSize(string.sub(text, 1, cursor - 1) .. "x", EDITOR_SIZE, EDITOR_FONT, Vector2.new(math.max(codeBox.AbsoluteSize.X - PAD_X * 2, 20), 100000))
+			end)
+			if not ok then
+				return
+			end
+			local lineBottom = size.Y + PAD_Y
+			local lineTop = lineBottom - EDITOR_SIZE - 4
+			local viewH = editor.AbsoluteWindowSize.Y
+			local top = editor.CanvasPosition.Y
+			if lineBottom > top + viewH - 4 then
+				scrollTo(lineBottom - viewH + 8)
+			elseif lineTop < top then
+				scrollTo(lineTop - 4)
+			end
+		end
+
+		-- A TextBox swallows touch input, so dragging on it never reached the ScrollingFrame. Scroll it by hand.
+		local dragInput, dragStartY, dragStartScroll
+		connect(codeBox.InputBegan, function(input)
+			if input.UserInputType == Enum.UserInputType.Touch then
+				dragInput = input
+				dragStartY = input.Position.Y
+				dragStartScroll = editor.CanvasPosition.Y
+			end
+		end)
+		connect(UserInputService.InputChanged, function(input)
+			if dragInput and input == dragInput then
+				local dy = input.Position.Y - dragStartY
+				if math.abs(dy) > 3 then
+					scrollTo(dragStartScroll - dy)
+				end
+			end
+		end)
+		connect(UserInputService.InputEnded, function(input)
+			if input == dragInput then
+				dragInput = nil
+			end
+		end)
+
+		connect(codeBox:GetPropertyChangedSignal("Text"), function()
+			refreshHighlight()
+			relayout()
+			task.defer(function()
+				relayout()
+				followCursor()
+			end)
+		end)
+		connect(codeBox:GetPropertyChangedSignal("CursorPosition"), followCursor)
+		connect(codeBox:GetPropertyChangedSignal("TextBounds"), relayout)
+		connect(editor:GetPropertyChangedSignal("AbsoluteSize"), relayout)
+
+		refreshHighlight()
+		relayout()
+		task.defer(relayout)
+	end)()
 
 	-----------------------------------------------------------------
 	-- Buttons: Execute, Clear, Paste, Copy, Scan

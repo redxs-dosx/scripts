@@ -828,6 +828,7 @@ end
 setLogo("spooky")
 
 -- Spooky Mode: recolors the whole gui between the Halloween orange and the normal blue
+local Rainbow = { on = false, unlocked = false, wanted = false } -- filled in below
 local Spooky = { on = true }
 local function sameColor(a, b)
 	return math.abs(a.R - b.R) < 0.004 and math.abs(a.G - b.G) < 0.004 and math.abs(a.B - b.B) < 0.004
@@ -836,6 +837,9 @@ end
 function Spooky.apply(on)
 	Spooky.on = on
 	local from, to = theme.accent, on and theme.accentSpooky or theme.accentDefault
+	if Rainbow.on then
+		to = from -- Rainbow owns the accent colour, Spooky Mode only switches the logo and banner
+	end
 	if not sameColor(from, to) then
 		local oldHex, newHex = from:ToHex(), to:ToHex()
 		theme.accent = to
@@ -872,6 +876,169 @@ function Spooky.apply(on)
 	if Spooky.banner then
 		Spooky.banner.Visible = on
 	end
+end
+
+-- Rainbow theme: hidden until it is unlocked from the Credits in Settings. The accent colour cycles through
+-- every hue. Instead of scanning the whole gui every frame, a slow background scan finds everything that
+-- currently has the accent colour, and a light 30 fps loop only recolours those.
+Rainbow.file = SAVE_FOLDER .. "/rainbow.state" -- holds "unlocked" or "on"
+
+function Rainbow.load()
+	if not fileSystemAvailable() then
+		return
+	end
+	pcall(function()
+		if isfile(Rainbow.file) then
+			local raw = readfile(Rainbow.file)
+			if raw == "on" then
+				Rainbow.unlocked, Rainbow.wanted = true, true
+			elseif raw == "unlocked" then
+				Rainbow.unlocked = true
+			end
+		end
+	end)
+end
+
+function Rainbow.save()
+	if not (fileSystemAvailable() and Rainbow.unlocked) then
+		return
+	end
+	pcall(function()
+		if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(SAVE_FOLDER) then
+			makefolder(SAVE_FOLDER)
+		end
+		writefile(Rainbow.file, Rainbow.wanted and "on" or "unlocked")
+	end)
+end
+
+do
+	local RunService = game:GetService("RunService")
+	local TICK = 1 / 30 -- colour updates per second
+	local SPEED = 0.08 -- full colour cycles per second
+	local RECENT_MAX = 150 -- how many past colours still count as "the accent colour"
+	local SLICE = 600 -- instances looked at per frame while scanning
+
+	local recent, recentOrder = {}, {}
+	local tracked = {} -- { instance, property }
+	local scanList, scanIndex, scanNew, scanWait = nil, 1, {}, 0
+	local hue, acc, conn = 0, 0, nil
+
+	local function colorKey(c)
+		return math.floor(c.R * 255 + 0.5) * 65536 + math.floor(c.G * 255 + 0.5) * 256 + math.floor(c.B * 255 + 0.5)
+	end
+
+	local function remember(c)
+		local k = colorKey(c)
+		recent[k] = (recent[k] or 0) + 1
+		table.insert(recentOrder, k)
+		if #recentOrder > RECENT_MAX then
+			local old = table.remove(recentOrder, 1)
+			local n = (recent[old] or 1) - 1
+			recent[old] = n > 0 and n or nil
+		end
+	end
+
+	-- Adds every accent-coloured property of this instance to list
+	local function examine(d, list)
+		if d:IsA("GuiObject") then
+			if recent[colorKey(d.BackgroundColor3)] then
+				table.insert(list, { d, "BackgroundColor3" })
+			end
+			if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+				if recent[colorKey(d.TextColor3)] then
+					table.insert(list, { d, "TextColor3" })
+				end
+			elseif d:IsA("ImageLabel") or d:IsA("ImageButton") then
+				if recent[colorKey(d.ImageColor3)] then
+					table.insert(list, { d, "ImageColor3" })
+				end
+			elseif d:IsA("ScrollingFrame") then
+				if recent[colorKey(d.ScrollBarImageColor3)] then
+					table.insert(list, { d, "ScrollBarImageColor3" })
+				end
+			end
+		elseif d:IsA("UIStroke") then
+			if recent[colorKey(d.Color)] then
+				table.insert(list, { d, "Color" })
+			end
+		end
+	end
+
+	local function step(dt)
+		if not gui.Parent then
+			return
+		end
+		acc += dt
+		if acc >= TICK then
+			hue = (hue + SPEED * acc) % 1
+			acc = 0
+			local color = Color3.fromHSV(hue, 0.68, 1)
+			for i = 1, #tracked do
+				local e = tracked[i]
+				local inst, prop = e[1], e[2]
+				-- only touch it if it still has an accent colour (a toggle that turned off has moved on)
+				if inst.Parent and recent[colorKey(inst[prop])] then
+					inst[prop] = color
+				end
+			end
+			remember(color)
+			theme.accent = color
+			toastColors.info = color
+		end
+
+		-- background scan, a slice per frame, then a pause. New buttons and rows get picked up here
+		if not scanList then
+			scanWait -= dt
+			if scanWait <= 0 then
+				scanList, scanIndex, scanNew = gui:GetDescendants(), 1, {}
+			end
+		else
+			local last = math.min(scanIndex + SLICE - 1, #scanList)
+			for i = scanIndex, last do
+				local d = scanList[i]
+				if d.Parent then
+					examine(d, scanNew)
+				end
+			end
+			scanIndex = last + 1
+			if scanIndex > #scanList then
+				tracked, scanList, scanWait = scanNew, nil, 1
+			end
+		end
+	end
+
+	function Rainbow.set(on)
+		on = on == true
+		if Rainbow.on == on then
+			return
+		end
+		Rainbow.on = on
+		if on then
+			hue = theme.accent:ToHSV() -- start from the current colour so nothing jumps
+			recent, recentOrder = {}, {}
+			remember(theme.accent)
+			tracked, scanList, scanWait, acc = {}, nil, 0, 0
+			conn = connect(RunService.Heartbeat, step)
+		else
+			if conn then
+				conn:Disconnect()
+				conn = nil
+			end
+			-- put everything that still has a rainbow colour back to the normal accent
+			local to = Spooky.on and theme.accentSpooky or theme.accentDefault
+			for _, d in ipairs(gui:GetDescendants()) do
+				local list = {}
+				examine(d, list)
+				for _, e in ipairs(list) do
+					e[1][e[2]] = to
+				end
+			end
+			theme.accent, toastColors.info = to, to
+			recent, recentOrder, tracked, scanList = {}, {}, {}, nil
+		end
+	end
+
+	Rainbow.load()
 end
 
 new("TextLabel", {
@@ -1294,6 +1461,7 @@ local function addTab(name)
 			Get = function()
 				return state
 			end,
+			Row = r,
 			SetEnabled = setEnabled,
 			IsEnabled = function()
 				return enabled
@@ -5626,13 +5794,41 @@ do
 					universeId = g.universeId,
 					placeId = g.rootPlaceId or g.placeId,
 					name = tostring(g.name or "Unknown"),
-					players = g.playerCount or 0,
+					players = tonumber(g.playerCount or g.playing) or 0,
 					up = g.totalUpVotes or 0,
 					down = g.totalDownVotes or 0,
 				})
 			end
 		end
 		return out
+	end
+
+	-- The explore / search lists don't reliably carry a live player count (it came back as 0 for every game),
+	-- so ask the games endpoint for the real "playing" number, up to 100 games per request
+	local function fillPlayerCounts(list)
+		if #list == 0 then
+			return list
+		end
+		local ids = {}
+		for i = 1, math.min(#list, 100) do
+			table.insert(ids, tostring(list[i].universeId))
+		end
+		local data = fetchJson("https://games.roblox.com/v1/games?universeIds=" .. table.concat(ids, ","))
+		if data and typeof(data.data) == "table" then
+			local counts = {}
+			for _, entry in ipairs(data.data) do
+				if typeof(entry) == "table" and entry.id and tonumber(entry.playing) then
+					counts[tostring(entry.id)] = tonumber(entry.playing)
+				end
+			end
+			for _, g in ipairs(list) do
+				local n = counts[tostring(g.universeId)]
+				if n then
+					g.players = n
+				end
+			end
+		end
+		return list
 	end
 
 	local function trendingGames()
@@ -5668,7 +5864,7 @@ do
 		if #games == 0 then
 			return nil, "Roblox returned no trending games."
 		end
-		return games
+		return fillPlayerCounts(games)
 	end
 
 	local function searchGames(query)
@@ -5695,7 +5891,7 @@ do
 		if #games == 0 then
 			return nil, data and ('No games found for "' .. query .. '".') or "Couldn't reach Roblox. Check that your executor allows HTTP requests."
 		end
-		return games
+		return fillPlayerCounts(games)
 	end
 
 	-- ScriptBlox scripts -------------------------------------------
@@ -6360,7 +6556,7 @@ do
 	local P = {
 	  token = nil, refresh = nil, uid = nil, expires = 0,
 	  offset = 0, share = true, running = true,
-	  users = {}, err = nil, beatNow = true, pollNow = true,
+	  users = {}, errs = {}, beatOk = false, beatNow = true, pollNow = true,
 	}
 	local presenceConfigured = not (
 	  string.find(PRESENCE.url, "YOUR-PROJECT", 1, true) or string.find(PRESENCE.apiKey, "YOUR_", 1, true)
@@ -6410,134 +6606,184 @@ do
 	  end)
 	end
 
+	-- Errors are kept per step so a failed write can't be hidden by a successful read
+	local function currentErr()
+		return P.errs.auth or P.errs.beat or P.errs.read
+	end
+
+	-- The text Firebase sends back with an error, e.g. "Permission denied"
+	local function serverMessage(res)
+		local d = res and res.Body and decode(res.Body)
+		if typeof(d) == "table" and d.error ~= nil then
+			if typeof(d.error) == "table" then
+				return tostring(d.error.message or "")
+			end
+			return tostring(d.error)
+		end
+		return ""
+	end
+
 	local function authenticate()
-	  if P.token and os.time() < P.expires - 60 then
-	    return true
-	  end
-	  local key = PRESENCE.apiKey
-	  if P.refresh then
-	    local res, status = httpReq({
-	      Url = "https://securetoken.googleapis.com/v1/token?key=" .. key,
-	      Method = "POST",
-	      Headers = { ["Content-Type"] = "application/x-www-form-urlencoded" },
-	      Body = "grant_type=refresh_token&refresh_token=" .. HttpService:UrlEncode(P.refresh),
-	    })
-	    local d = res and status == 200 and decode(res.Body)
-	    if d and d.id_token then
-	      P.token, P.uid = d.id_token, d.user_id
-	      P.refresh = d.refresh_token or P.refresh
-	      P.expires = os.time() + (tonumber(d.expires_in) or 3600)
-	      saveRefreshToken()
-	      return true
-	    end
-	    P.refresh = nil
-	  end
-	  local res, status, why = httpReq({
-	    Url = "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" .. key,
-	    Method = "POST",
-	    Headers = { ["Content-Type"] = "application/json" },
-	    Body = '{"returnSecureToken":true}',
-	  })
-	  if not res then
-	    P.err = why
-	    return false
-	  end
-	  local d = decode(res.Body)
-	  if status == 200 and d and d.idToken then
-	    P.token, P.refresh, P.uid = d.idToken, d.refreshToken, d.localId
-	    P.expires = os.time() + (tonumber(d.expiresIn) or 3600)
-	    saveRefreshToken()
-	    return true
-	  end
-	  local msg = d and d.error and tostring(d.error.message) or ""
-	  if string.find(msg, "OPERATION_NOT_ALLOWED", 1, true) or string.find(msg, "ADMIN_ONLY", 1, true) then
-	    P.err = "Turn on Anonymous sign-in in Firebase (Authentication > Sign-in method)."
-	  elseif string.find(msg, "API key", 1, true) then
-	    P.err = "The Firebase API key isn't valid."
-	  else
-	    P.err = "Firebase sign-in failed (" .. status .. ")."
-	  end
-	  return false
+		if P.token and os.time() < P.expires - 60 then
+			return true
+		end
+		local key = PRESENCE.apiKey
+		if P.refresh then
+			local res, status = httpReq({
+				Url = "https://securetoken.googleapis.com/v1/token?key=" .. key,
+				Method = "POST",
+				Headers = { ["Content-Type"] = "application/x-www-form-urlencoded" },
+				Body = "grant_type=refresh_token&refresh_token=" .. HttpService:UrlEncode(P.refresh),
+			})
+			local d = res and status == 200 and decode(res.Body)
+			if d and d.id_token then
+				P.token, P.uid = d.id_token, d.user_id
+				P.refresh = d.refresh_token or P.refresh
+				P.expires = os.time() + (tonumber(d.expires_in) or 3600)
+				P.errs.auth = nil
+				saveRefreshToken()
+				return true
+			end
+			P.refresh = nil
+		end
+		local res, status, why = httpReq({
+			Url = "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" .. key,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = '{"returnSecureToken":true}',
+		})
+		if not res then
+			P.errs.auth = why
+			return false
+		end
+		local d = decode(res.Body)
+		if status == 200 and d and d.idToken then
+			P.token, P.refresh, P.uid = d.idToken, d.refreshToken, d.localId
+			P.expires = os.time() + (tonumber(d.expiresIn) or 3600)
+			P.errs.auth = nil
+			saveRefreshToken()
+			return true
+		end
+		local msg = d and d.error and tostring(d.error.message) or ""
+		if string.find(msg, "OPERATION_NOT_ALLOWED", 1, true) or string.find(msg, "ADMIN_ONLY", 1, true) then
+			P.errs.auth = "Turn on Anonymous sign-in in Firebase (Authentication > Sign-in method)."
+		elseif string.find(msg, "API key", 1, true) then
+			P.errs.auth = "The Firebase API key isn't valid."
+		else
+			P.errs.auth = "Firebase sign-in failed (" .. status .. ")" .. (msg ~= "" and (": " .. msg) or ".")
+		end
+		return false
 	end
 
 	local function dbUrl(path, extra)
-	  return PRESENCE.url .. path .. ".json?auth=" .. P.token .. (extra or "")
+		return PRESENCE.url .. path .. ".json?auth=" .. P.token .. (extra or "")
 	end
 
 	local function beat()
-	  if not authenticate() then
-	    return false
-	  end
-	  local res, status, why = httpReq({
-	    Url = dbUrl("/presence/" .. P.uid),
-	    Method = "PUT",
-	    Headers = { ["Content-Type"] = "application/json" },
-	    Body = HttpService:JSONEncode({
-	      n = player.Name,
-	      d = player.DisplayName,
-	      t = { [".sv"] = "timestamp" },
-	    }),
-	  })
-	  if not res then
-	    P.err = why
-	    return false
-	  end
-	  if status == 200 then
-	    local d = decode(res.Body)
-	    if d and tonumber(d.t) then
-	      P.offset = d.t - os.time() * 1000 -- server clock vs this device's clock
-	    end
-	    P.err = nil
-	    return true
-	  end
-	  if status == 401 then
-	    P.token = nil
-	  end
-	  P.err = status == 401 and "Firebase rejected the sign-in." or "Firebase rules blocked the update (" .. status .. ")."
-	  return false
+		if not authenticate() then
+			P.beatOk = false
+			return false
+		end
+		local res, status, why = httpReq({
+			Url = dbUrl("/presence/" .. P.uid),
+			Method = "PUT",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode({
+				n = player.Name,
+				d = player.DisplayName,
+				t = { [".sv"] = "timestamp" },
+			}),
+		})
+		if not res then
+			P.errs.beat, P.beatOk = why, false
+			return false
+		end
+		if status == 200 then
+			local d = decode(res.Body)
+			if typeof(d) == "table" and tonumber(d.t) then
+				P.offset = d.t - os.time() * 1000 -- server clock vs this device's clock
+			end
+			P.errs.beat, P.beatOk = nil, true
+			return true
+		end
+		P.beatOk = false
+		local msg = serverMessage(res)
+		local lower = msg:lower()
+		if status == 401 and string.find(lower, "token", 1, true) then
+			P.token = nil -- expired or invalid, sign in again next time
+			P.errs.beat = "Firebase rejected the sign-in."
+		elseif status == 401 or status == 403 then
+			P.errs.beat = "Firebase rules blocked your entry. Publish firebase-rules.json (Realtime Database > Rules)."
+		else
+			P.errs.beat = "Firebase refused your entry (" .. status .. ")" .. (msg ~= "" and (": " .. msg) or ".")
+		end
+		return false
 	end
 
 	local function leave()
-	  if not (P.token and P.uid) then
-	    return
-	  end
-	  httpReq({ Url = dbUrl("/presence/" .. P.uid), Method = "DELETE" })
+		if not (P.token and P.uid) then
+			return
+		end
+		httpReq({ Url = dbUrl("/presence/" .. P.uid), Method = "DELETE" })
 	end
 
 	local function fetchOnline()
-	  if not authenticate() then
-	    return
-	  end
-	  local cutoff = os.time() * 1000 + P.offset - PRESENCE.window * 1000
-	  local res, status, why = httpReq({
-	    Url = dbUrl("/presence", string.format("&orderBy=%%22t%%22&startAt=%d&limitToLast=%d", cutoff, PRESENCE.limit)),
-	    Method = "GET",
-	  })
-	  if not res then
-	    P.err = why
-	    return
-	  end
-	  if status ~= 200 then
-	    P.err = status == 401 and "Firebase rejected the sign-in." or "Couldn't read the list (" .. status .. "). Check your rules and .indexOn."
-	    return
-	  end
-	  P.err = nil
-	  local data = decode(res.Body)
-	  local list = {}
-	  if typeof(data) == "table" then
-	    for uid, v in pairs(data) do
-	      if typeof(v) == "table" and typeof(v.n) == "string" then
-	        table.insert(list, { name = v.n, display = typeof(v.d) == "string" and v.d or v.n, me = uid == P.uid })
-	      end
-	    end
-	  end
-	  table.sort(list, function(a, b)
-	    if a.me ~= b.me then
-	      return a.me
-	    end
-	    return string.lower(a.display) < string.lower(b.display)
-	  end)
-	  P.users = list
+		if not authenticate() then
+			return
+		end
+		local cutoff = os.time() * 1000 + P.offset - PRESENCE.window * 1000
+		local res, status, why = httpReq({
+			Url = dbUrl("/presence", string.format("&orderBy=%%22t%%22&startAt=%.0f&limitToLast=%d", cutoff, PRESENCE.limit)),
+			Method = "GET",
+		})
+		if not res then
+			P.errs.read = why
+			return
+		end
+		if status ~= 200 then
+			local msg = serverMessage(res)
+			local lower = msg:lower()
+			if status == 401 and string.find(lower, "token", 1, true) then
+				P.token = nil
+				P.errs.read = "Firebase rejected the sign-in."
+			elseif status == 401 or status == 403 then
+				P.errs.read = "Firebase rules blocked reading the list. Publish firebase-rules.json."
+			elseif status == 400 and string.find(lower, "index", 1, true) then
+				P.errs.read = 'The database needs an index: add ".indexOn": ["t"] under "presence" in the rules.'
+			else
+				P.errs.read = "Couldn't read the list (" .. status .. ")" .. (msg ~= "" and (": " .. msg) or ".")
+			end
+			return
+		end
+		P.errs.read = nil
+		local data = decode(res.Body)
+		local list = {}
+		if typeof(data) == "table" then
+			for uid, v in pairs(data) do
+				if typeof(v) == "table" and typeof(v.n) == "string" then
+					table.insert(list, { name = v.n, display = typeof(v.d) == "string" and v.d or v.n, me = uid == P.uid })
+				end
+			end
+		end
+		-- while you're shared and your last update went through, you are online, so you are always in the count
+		if P.share and P.beatOk then
+			local found = false
+			for _, u in ipairs(list) do
+				if u.me then
+					found = true
+				end
+			end
+			if not found then
+				table.insert(list, { name = player.Name, display = player.DisplayName, me = true })
+			end
+		end
+		table.sort(list, function(a, b)
+			if a.me ~= b.me then
+				return a.me
+			end
+			return string.lower(a.display) < string.lower(b.display)
+		end)
+		P.users = list
 	end
 
 	-- UI: collapsed card with the count, tap to open the list
@@ -6604,14 +6850,14 @@ do
 	  local text, color
 	  if not presenceConfigured then
 	    text, color = "Setup needed", theme.amber
-	  elseif P.err and n == 0 then
+	  elseif currentErr() and n == 0 then
 	    text, color = "Offline", theme.red
 	  else
 	    text = (n >= PRESENCE.limit) and (PRESENCE.limit .. "+") or tostring(n)
 	    color = theme.text
 	  end
 	  onlineCount.Text, onlineCount.TextColor3 = text, color
-	  onlineDot.BackgroundColor3 = (presenceConfigured and not P.err) and toastColors.success or theme.dim
+	  onlineDot.BackgroundColor3 = (presenceConfigured and not currentErr()) and toastColors.success or theme.dim
 
 	  for _, c in ipairs(onlineList:GetChildren()) do
 	    if c:IsA("TextLabel") then
@@ -6621,7 +6867,7 @@ do
 	  local rows = math.max(n, 1)
 	  if n == 0 then
 	    local msg = not presenceConfigured and "Add your Firebase URL and API key at the top of the Players online block."
-	      or P.err or "Nobody online yet."
+	      or currentErr() or "Nobody online yet."
 	    new("TextLabel", {
 	      Text = msg,
 	      Font = Enum.Font.Gotham,
@@ -6685,11 +6931,15 @@ do
 	      local now = os.clock()
 	      if P.share and (P.beatNow or now - lastBeat >= PRESENCE.beat) then
 	        P.beatNow, lastBeat = false, now
-	        beat()
+	        if not pcall(beat) then
+	          P.beatOk, P.errs.beat = false, "Updating your entry failed."
+	        end
 	      end
 	      if P.pollNow or now - lastPoll >= PRESENCE.poll then
 	        P.pollNow, lastPoll = false, now
-	        fetchOnline()
+	        if not pcall(fetchOnline) then
+	          P.errs.read = "Reading the list failed."
+	        end
 	        renderOnline()
 	      end
 	      task.wait(1)
@@ -9881,6 +10131,12 @@ settingsTab:Toggle("Spooky Mode", true, function(state)
 	Spooky.apply(state)
 end, "ui.spooky")
 settingsTab:Label("Halloween theme: orange colors, the Halloween logo and the Happy Spooktober! banner on Main.")
+Rainbow.toggle = settingsTab:Toggle("Rainbow theme", Rainbow.wanted, function(state)
+	Rainbow.wanted = state
+	Rainbow.set(state)
+	Rainbow.save()
+end)
+Rainbow.toggle.Row.Visible = Rainbow.unlocked -- stays hidden until it is unlocked from the Credits below
 settingsTab:Keybind("Toggle key", "RightShift", function(name)
 	toggleKey = name ~= "None" and Enum.KeyCode[name] or nil
 	notify("Toggle key: " .. name)
@@ -10090,6 +10346,39 @@ watermark.Font = Enum.Font.GothamBold
 watermark.TextSize = 13
 watermark.TextColor3 = theme.accent
 watermark.TextXAlignment = Enum.TextXAlignment.Center
+
+-- Tap the credits three times in a row to unlock the Rainbow theme
+do
+	local hit = new("TextButton", {
+		Text = "",
+		AutoButtonColor = false,
+		BackgroundTransparency = 1,
+		Size = UDim2.fromScale(1, 1),
+		ZIndex = watermark.ZIndex + 1,
+	}, watermark)
+	local taps, lastTap = 0, 0
+	connect(hit.Activated, function()
+		local now = os.clock()
+		if now - lastTap > 1.2 then
+			taps = 0
+		end
+		lastTap = now
+		taps += 1
+		if taps < 3 then
+			return
+		end
+		taps = 0
+		if Rainbow.unlocked then
+			notify("Rainbow theme is already unlocked. Use the toggle under Spooky Mode.", "info")
+			return
+		end
+		Rainbow.unlocked = true
+		Rainbow.toggle.Row.Visible = true
+		Rainbow.toggle.Set(true) -- turns it on and saves it
+		Rainbow.save()
+		notify("Rainbow theme unlocked!", "success")
+	end)
+end
 
 task.spawn(function()
 	while gui.Parent do
@@ -10365,6 +10654,9 @@ if keepEnabled then
 	end
 end
 
+if Rainbow.unlocked and Rainbow.wanted then
+	Rainbow.set(true)
+end
 Modules.startupDone = true
 selectTab(mainTab)
 tween(main, 0.4, { GroupTransparency = 0 })

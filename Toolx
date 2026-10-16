@@ -6244,8 +6244,8 @@ do
 	-- Setup: fill in PRESENCE.url and PRESENCE.apiKey (see firebase-rules.json)
 	-----------------------------------------------------------------
 	local PRESENCE = {
-	  url = "https://YOUR-PROJECT-default-rtdb.firebaseio.com", -- Realtime Database URL, no trailing slash
-	  apiKey = "YOUR_FIREBASE_WEB_API_KEY",                     -- Project settings > Web API key
+	  url = "https://toolx-277de-default-rtdb.firebaseio.com", -- Realtime Database URL, no trailing slash
+	  apiKey = "AIzaSyD3LVSKlH0jSffSGs-CYsvAYOTHZRRxAUo",                     -- Project settings > Web API key
 	  beat = 30,    -- seconds between "I'm here" updates
 	  poll = 60,    -- seconds between list refreshes
 	  window = 90,  -- seen within this many seconds = online

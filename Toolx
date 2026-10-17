@@ -6943,6 +6943,165 @@ do
 	end)
 
 	-----------------------------------------------------------------
+	-- Easter egg: tap the profile picture 3 times -> sound + red tint + shake
+	-----------------------------------------------------------------
+	do
+		local EGG = {
+			taps = 0,
+			last = 0,
+			busy = false,
+			asset = nil,
+			file = "Toolx/roblox.m4a",
+			urls = {
+				"https://github.com/redxs-dosx/scripts/raw/main/roblox.m4a",
+				"https://raw.githubusercontent.com/redxs-dosx/scripts/main/roblox.m4a",
+				"https://raw.githubusercontent.com/redxs-dosx/scripts/master/roblox.m4a",
+			},
+		}
+
+		local hit = new("TextButton", {
+			Text = "",
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+			ZIndex = 5,
+		}, avatar)
+
+		-- downloads the audio once (cached in the Toolx folder) and returns a playable asset id
+		local function getSoundId()
+			if EGG.asset then
+				return EGG.asset
+			end
+			local getAsset = getcustomasset or getsynasset
+			if not (getAsset and writefile and game.HttpGet) then
+				return nil
+			end
+			pcall(function()
+				if makefolder and isfolder and not isfolder("Toolx") then
+					makefolder("Toolx")
+				end
+			end)
+			local have = false
+			pcall(function()
+				have = typeof(isfile) == "function" and isfile(EGG.file)
+			end)
+			if not have then
+				for _, url in ipairs(EGG.urls) do
+					local ok, data = pcall(function()
+						return game:HttpGet(url)
+					end)
+					if ok and typeof(data) == "string" and #data > 1000
+						and not string.find(string.sub(data, 1, 300), "<!DOCTYPE", 1, true)
+						and not string.find(string.sub(data, 1, 300), "<html", 1, true) then
+						if pcall(writefile, EGG.file, data) then
+							have = true
+							break
+						end
+					end
+				end
+			end
+			if have then
+				local ok, id = pcall(getAsset, EGG.file)
+				if ok then
+					EGG.asset = id
+				end
+			end
+			return EGG.asset
+		end
+
+		local function trigger()
+			if EGG.busy then
+				return
+			end
+			EGG.busy = true
+			task.spawn(function()
+				local sound = new("Sound", { Name = "ToolxEgg", Volume = 1 }, game:GetService("SoundService"))
+				local duration = 3
+				local id = getSoundId()
+				if id and sound.Parent then
+					sound.SoundId = id
+					local t0 = os.clock()
+					while not sound.IsLoaded and os.clock() - t0 < 5 do
+						task.wait()
+					end
+					if sound.IsLoaded and sound.TimeLength > 0 then
+						duration = math.clamp(sound.TimeLength, 1, 10)
+						sound:Play()
+					else
+						notify("Couldn't play the audio", "warn")
+					end
+				else
+					notify("Couldn't load the audio", "warn")
+				end
+
+				local tint = new("Frame", {
+					Name = "ToolxTint",
+					Size = UDim2.fromScale(1, 1),
+					BackgroundColor3 = Color3.fromRGB(255, 0, 0),
+					BackgroundTransparency = 1,
+					BorderSizePixel = 0,
+					Active = false,
+					ZIndex = 100,
+				}, gui)
+				tween(tint, 0.3, { BackgroundTransparency = 0.55 })
+
+				local baseWin = main.Position
+				local stepName = "ToolxEggShake"
+				local startedAt = os.clock()
+				local function rnd()
+					return math.random() * 2 - 1
+				end
+
+				local function finish()
+					pcall(function()
+						RunService:UnbindFromRenderStep(stepName)
+					end)
+					if gui.Parent then
+						main.Position = baseWin
+						tween(tint, 0.4, { BackgroundTransparency = 1 })
+					end
+					task.delay(0.5, function()
+						pcall(function() tint:Destroy() end)
+						pcall(function() sound:Destroy() end)
+						EGG.busy = false
+					end)
+				end
+
+				RunService:BindToRenderStep(stepName, Enum.RenderPriority.Camera.Value + 1, function()
+					local el = os.clock() - startedAt
+					if el >= duration or not gui.Parent then
+						finish()
+						return
+					end
+					local m = 0.4 + 0.6 * (1 - el / duration) -- fades out toward the end
+					local cam = workspace.CurrentCamera
+					if cam then
+						cam.CFrame = cam.CFrame
+							* CFrame.new(rnd() * 0.35 * m, rnd() * 0.35 * m, 0)
+							* CFrame.Angles(0, 0, math.rad(rnd() * 2 * m))
+					end
+					main.Position = baseWin + UDim2.fromOffset(rnd() * 8 * m, rnd() * 8 * m)
+				end)
+			end)
+		end
+
+		connect(hit.Activated, function()
+			local now = os.clock()
+			if now - EGG.last > 1.2 then
+				EGG.taps = 0
+			end
+			EGG.last = now
+			EGG.taps += 1
+			if EGG.taps == 1 then
+				task.spawn(getSoundId) -- start downloading early so the third tap plays right away
+			end
+			if EGG.taps >= 3 then
+				EGG.taps = 0
+				trigger()
+			end
+		end)
+	end
+
+	-----------------------------------------------------------------
 	-- Players online (Firebase Realtime Database, anonymous auth)
 	-- Setup: fill in PRESENCE.url and PRESENCE.apiKey (see firebase-rules.json)
 	-----------------------------------------------------------------

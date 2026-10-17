@@ -5,6 +5,7 @@
 	Close:     the X button
 	Minimize:  the - button (collapses into a pill at the top, tap the pill to restore)
 	PC:        the toggle key minimizes / restores (RightShift by default, rebind it in Settings)
+Cmdbar:    Settings > Cmdbar swaps the window for a command bar. Type "exitcmd" to come back, "cmds" for the list.
 
 	Add features later through the exposed API:
 		local tab = Toolx.AddTab("Name")
@@ -14,6 +15,7 @@
 		tab:Toggle("Text", false, function(state) end)
 		tab:Keybind("Text", "F4", function(keyName) end)
 		Toolx.Notify("text", "info" | "success" | "warn" | "error")
+		Toolx.AddCommand("name", "[usage]", "what it does", function(args) end, { "alias" })
 ]]
 
 local VERSION = "0.4"
@@ -9878,7 +9880,7 @@ do
 end
 
 physicsTab:Section("Noclip")
-physicsTab:DropToggle("Noclip", { "Norm NC", "Wall TP" }, function(option)
+Noclip.Drop = physicsTab:DropToggle("Noclip", { "Norm NC", "Wall TP" }, function(option)
 	Noclip.Set(option)
 	notify(option and ("Noclip: " .. option) or "Noclip off", option and "success" or "info")
 end)
@@ -10115,6 +10117,7 @@ end)
 
 scanResultsBox = scannerTab:LogBox(140, 40, "No scan performed yet")
 
+local Cmdbar = { active = false } -- the command bar, built in the "Command bar" section further down
 local settingsTab = addTab("Settings")
 settingsTab:Section("Interface")
 settingsTab:Toggle("Background blur", true, function(state)
@@ -10142,6 +10145,14 @@ settingsTab:Keybind("Toggle key", "RightShift", function(name)
 	notify("Toggle key: " .. name)
 end, "ui.toggleKey")
 settingsTab:Label("Tap Toggle key, then press a key. Esc cancels, Backspace removes the key. Pick one the game doesn't use, since it also fires while you play.")
+Cmdbar.Toggle = settingsTab:Toggle("Cmdbar", false, function(state)
+	if state then
+		Cmdbar.Enter()
+	else
+		Cmdbar.Exit()
+	end
+end)
+settingsTab:Label("Swaps this window for an Infinite Yield style command bar. Tap the bar or press ; to type, cmds lists every command, exitcmd brings this window back.")
 local keepToggle = settingsTab:Toggle("Keep options", savedData.keep, function(state)
 	keepEnabled = state
 	if state then
@@ -10468,7 +10479,7 @@ local animId = 0
 local lastPos = main.Position
 
 local function minimize()
-	if minimized or closing then
+	if minimized or closing or Cmdbar.active then
 		return
 	end
 	minimized = true
@@ -10496,7 +10507,7 @@ local function minimize()
 end
 
 local function restore()
-	if not minimized or closing then
+	if not minimized or closing or Cmdbar.active then
 		return
 	end
 	minimized = false
@@ -10515,6 +10526,805 @@ local function restore()
 	tween(main, 0.45, { Position = lastPos, GroupTransparency = 0 })
 	tween(mainScale, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
 	setBlur(true)
+end
+
+---------------------------------------------------------------------
+-- Command bar (Infinite Yield style)
+-- Settings > Cmdbar swaps the window for a command bar at the bottom of the screen.
+-- Tap the bar (or press ;) to type. Tab completes, Up / Down pick a suggestion or an older command,
+-- Enter runs it. Type "exitcmd" to bring the window back, "cmds" for the command list.
+-- Add your own: Toolx.AddCommand("name", "[usage]", "what it does", function(args) end, { "alias" })
+---------------------------------------------------------------------
+do
+	-- own function: the main chunk is close to Luau's 200 local variable limit
+	local function build()
+		local FONT = Enum.Font.SourceSans
+		local FONT_BOLD = Enum.Font.SourceSansBold
+		local BAR_BG = Color3.fromRGB(46, 46, 47)
+		local PANEL_BG = Color3.fromRGB(36, 36, 37)
+		local BAR_H, ROW_H, MAX_ROWS, BAR_GAP = 34, 26, 6, 26
+		local HIDDEN_Y = BAR_H + 40
+
+		local commands, lookup = {}, {}
+		local history, historyPos, historyText = {}, 0, nil
+		local matches, selected = {}, 1
+
+		function Cmdbar.AddCommand(name, usage, desc, run, aliases)
+			name = string.lower(name)
+			local old = lookup[name]
+			if old then
+				for i, c in ipairs(commands) do
+					if c == old then
+						table.remove(commands, i)
+						break
+					end
+				end
+			end
+			local cmd = {
+				name = name,
+				usage = usage or "",
+				desc = desc or "",
+				run = run,
+				aliases = {},
+				takesPlayer = string.find(usage or "", "player", 1, true) ~= nil,
+			}
+			for _, alias in ipairs(aliases or {}) do
+				table.insert(cmd.aliases, string.lower(alias))
+			end
+			table.insert(commands, cmd)
+			table.sort(commands, function(a, b)
+				return a.name < b.name
+			end)
+			lookup[name] = cmd
+			for _, alias in ipairs(cmd.aliases) do
+				lookup[alias] = cmd
+			end
+			return cmd
+		end
+
+		local function viewport()
+			local cam = workspace.CurrentCamera
+			return cam and cam.ViewportSize or Vector2.new(800, 450)
+		end
+
+		local function barWidth()
+			return math.clamp(math.floor(viewport().X * 0.6), 240, 460)
+		end
+
+		-----------------------------------------------------------------
+		-- Gui
+		-----------------------------------------------------------------
+		local root = new("Frame", {
+			Name = "Cmdbar",
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+			Visible = false,
+			ZIndex = 20,
+		}, gui)
+
+		local bar = new("Frame", {
+			Name = "Bar",
+			AnchorPoint = Vector2.new(0.5, 1),
+			Position = UDim2.new(0.5, 0, 1, HIDDEN_Y),
+			Size = UDim2.fromOffset(barWidth(), BAR_H),
+			BackgroundColor3 = BAR_BG,
+			BackgroundTransparency = 0.08,
+			BorderSizePixel = 0,
+			ZIndex = 21,
+		}, root)
+		corner(bar, 5)
+		local barStroke = stroke(bar, 0.8)
+
+		new("TextLabel", {
+			Text = ">",
+			Font = FONT_BOLD,
+			TextSize = 20,
+			TextColor3 = theme.accent,
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(10, 0),
+			Size = UDim2.fromOffset(16, BAR_H),
+			ZIndex = 23,
+		}, bar)
+
+		local box = new("TextBox", {
+			Name = "Input",
+			Text = "",
+			PlaceholderText = "Command Bar",
+			PlaceholderColor3 = theme.dim,
+			ClearTextOnFocus = false,
+			Font = FONT,
+			TextSize = 18,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+			ClipsDescendants = true,
+			ZIndex = 22,
+		}, bar)
+		new("UIPadding", { PaddingLeft = UDim.new(0, 28), PaddingRight = UDim.new(0, 10) }, box)
+
+		-- suggestion list above the bar
+		local preds = new("Frame", {
+			Name = "Suggestions",
+			AnchorPoint = Vector2.new(0.5, 1),
+			Position = UDim2.new(0.5, 0, 1, -(BAR_GAP + BAR_H + 4)),
+			Size = UDim2.fromOffset(barWidth(), 0),
+			BackgroundColor3 = BAR_BG,
+			BackgroundTransparency = 0.12,
+			BorderSizePixel = 0,
+			ClipsDescendants = true,
+			Visible = false,
+			ZIndex = 21,
+		}, root)
+		corner(preds, 5)
+		new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, preds)
+
+		local rows = {}
+		for i = 1, MAX_ROWS do
+			local button = new("TextButton", {
+				Text = "",
+				AutoButtonColor = false,
+				BackgroundColor3 = theme.accent,
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				Size = UDim2.new(1, 0, 0, ROW_H),
+				LayoutOrder = i,
+				Visible = false,
+				ZIndex = 22,
+			}, preds)
+			local label = new("TextLabel", {
+				RichText = true,
+				Text = "",
+				Font = FONT,
+				TextSize = 17,
+				TextColor3 = theme.text,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(12, 0),
+				Size = UDim2.new(1, -24, 1, 0),
+				ZIndex = 23,
+			}, button)
+			rows[i] = { button = button, label = label }
+		end
+
+		-- command list window ("cmds")
+		local panel = new("Frame", {
+			Name = "CommandList",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.42),
+			Size = UDim2.fromOffset(360, 260),
+			BackgroundColor3 = PANEL_BG,
+			BackgroundTransparency = 0.04,
+			BorderSizePixel = 0,
+			Active = true,
+			Visible = false,
+			ZIndex = 30,
+		}, root)
+		corner(panel, 6)
+		stroke(panel, 0.8)
+
+		new("TextLabel", {
+			Text = "Commands",
+			Font = FONT_BOLD,
+			TextSize = 19,
+			TextColor3 = theme.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 0),
+			Size = UDim2.new(1, -52, 0, 34),
+			ZIndex = 31,
+		}, panel)
+
+		local panelClose = new("TextButton", {
+			Text = "\u{00D7}",
+			Font = FONT_BOLD,
+			TextSize = 22,
+			TextColor3 = theme.dim,
+			AutoButtonColor = false,
+			BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -4, 0, 0),
+			Size = UDim2.fromOffset(34, 34),
+			ZIndex = 31,
+		}, panel)
+		connect(panelClose.MouseEnter, function()
+			panelClose.TextColor3 = theme.red
+		end)
+		connect(panelClose.MouseLeave, function()
+			panelClose.TextColor3 = theme.dim
+		end)
+
+		local panelList = new("ScrollingFrame", {
+			Position = UDim2.fromOffset(0, 34),
+			Size = UDim2.new(1, 0, 1, -34),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 3,
+			ScrollBarImageColor3 = theme.accent,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			ZIndex = 31,
+		}, panel)
+		new("UIPadding", {
+			PaddingLeft = UDim.new(0, 12),
+			PaddingRight = UDim.new(0, 12),
+			PaddingBottom = UDim.new(0, 10),
+		}, panelList)
+		new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, panelList)
+
+		local function fillPanel()
+			for _, child in ipairs(panelList:GetChildren()) do
+				if child:IsA("TextLabel") then
+					child:Destroy()
+				end
+			end
+			for i, cmd in ipairs(commands) do
+				local usage = cmd.usage ~= "" and (" " .. cmd.usage) or ""
+				local aliases = #cmd.aliases > 0 and ("  \u{00B7}  " .. table.concat(cmd.aliases, ", ")) or ""
+				new("TextLabel", {
+					RichText = true,
+					Text = string.format(
+						'<b>%s</b><font color="#9a9aa8">%s</font>\n<font color="#d0d0dc">%s</font><font color="#7c7c8c">%s</font>',
+						escapeRich(cmd.name),
+						escapeRich(usage),
+						escapeRich(cmd.desc),
+						escapeRich(aliases)
+					),
+					Font = FONT,
+					TextSize = 16,
+					TextColor3 = theme.text,
+					TextWrapped = true,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					TextYAlignment = Enum.TextYAlignment.Top,
+					BackgroundTransparency = 1,
+					AutomaticSize = Enum.AutomaticSize.Y,
+					Size = UDim2.new(1, 0, 0, 0),
+					LayoutOrder = i,
+					ZIndex = 32,
+				}, panelList)
+			end
+		end
+
+		local function setPanel(on)
+			if on then
+				fillPanel()
+			end
+			panel.Visible = on
+		end
+		connect(panelClose.Activated, function()
+			setPanel(false)
+		end)
+
+		local function layout()
+			local w = barWidth()
+			local v = viewport()
+			bar.Size = UDim2.fromOffset(w, BAR_H)
+			preds.Size = UDim2.fromOffset(w, #matches * ROW_H)
+			panel.Size = UDim2.fromOffset(math.clamp(v.X * 0.8, 260, 420), math.clamp(v.Y * 0.6, 160, 300))
+		end
+		layout()
+		do
+			local cam = workspace.CurrentCamera
+			if cam then
+				connect(cam:GetPropertyChangedSignal("ViewportSize"), layout)
+			end
+		end
+
+		-----------------------------------------------------------------
+		-- Suggestions + completion
+		-----------------------------------------------------------------
+		local function findPlayer(query)
+			query = string.lower(tostring(query or ""))
+			if query == "" then
+				return nil
+			end
+			local best, bestScore
+			for _, p in ipairs(Players:GetPlayers()) do
+				if p ~= player then
+					local name, display = string.lower(p.Name), string.lower(p.DisplayName)
+					local score
+					if name == query or display == query then
+						score = 1
+					elseif string.sub(name, 1, #query) == query then
+						score = 2
+					elseif string.sub(display, 1, #query) == query then
+						score = 3
+					elseif string.find(name, query, 1, true) or string.find(display, query, 1, true) then
+						score = 4
+					end
+					if score and (not bestScore or score < bestScore) then
+						best, bestScore = p, score
+					end
+				end
+			end
+			return best
+		end
+
+		local function matchKind(cmd, word)
+			if string.sub(cmd.name, 1, #word) == word then
+				return 1
+			end
+			for _, alias in ipairs(cmd.aliases) do
+				if string.sub(alias, 1, #word) == word then
+					return 1
+				end
+			end
+			if string.find(cmd.name, word, 1, true) then
+				return 2
+			end
+			return nil
+		end
+
+		local function renderSuggestions()
+			for i, row in ipairs(rows) do
+				local cmd = matches[i]
+				if cmd then
+					local usage = cmd.usage ~= "" and ('  <font color="#9a9aa8">' .. escapeRich(cmd.usage) .. "</font>") or ""
+					row.label.Text = "<b>" .. escapeRich(cmd.name) .. "</b>" .. usage
+					row.button.BackgroundColor3 = theme.accent
+					row.button.BackgroundTransparency = (i == selected) and 0.65 or 1
+					row.button.Visible = true
+				else
+					row.button.Visible = false
+				end
+			end
+			preds.Size = UDim2.fromOffset(barWidth(), #matches * ROW_H)
+			preds.Visible = #matches > 0 and box:IsFocused()
+		end
+
+		local function updateSuggestions()
+			matches, selected = {}, 1
+			local word, rest = string.match(box.Text, "^%s*;?(%S*)(.*)$")
+			word = string.lower(word or "")
+			if word ~= "" then
+				if rest ~= "" then
+					-- already past the command name: just show its usage
+					local cmd = lookup[word]
+					if cmd then
+						matches = { cmd }
+					end
+				else
+					local first, second = {}, {}
+					for _, cmd in ipairs(commands) do
+						local kind = matchKind(cmd, word)
+						if kind == 1 then
+							table.insert(first, cmd)
+						elseif kind == 2 then
+							table.insert(second, cmd)
+						end
+					end
+					for _, list in ipairs({ first, second }) do
+						for _, cmd in ipairs(list) do
+							if #matches < MAX_ROWS then
+								table.insert(matches, cmd)
+							end
+						end
+					end
+				end
+			end
+			renderSuggestions()
+		end
+
+		local function setText(text)
+			box.Text = text
+			box.CursorPosition = #text + 1
+		end
+
+		-- Tab: finish the command name, or the player name being typed
+		local function complete()
+			local text = box.Text
+			local word, rest = string.match(text, "^%s*;?(%S*)(.*)$")
+			if rest ~= "" then
+				local cmd = lookup[string.lower(word)]
+				if cmd and cmd.takesPlayer then
+					local head, last = string.match(text, "^(.*%s)(%S*)$")
+					if last and last ~= "" then
+						local p = findPlayer(last)
+						if p then
+							setText(head .. p.Name)
+						end
+					end
+				end
+			elseif matches[selected] then
+				setText(matches[selected].name .. " ")
+			end
+		end
+
+		-- tapping a suggestion fills it in (fires on press so it still works while the keyboard closes)
+		for i, row in ipairs(rows) do
+			connect(row.button.InputBegan, function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					local cmd = matches[i]
+					if cmd then
+						setText(cmd.name .. " ")
+						task.defer(function()
+							box:CaptureFocus()
+							box.CursorPosition = #box.Text + 1
+						end)
+					end
+				end
+			end)
+		end
+
+		-----------------------------------------------------------------
+		-- Running commands
+		-----------------------------------------------------------------
+		function Cmdbar.Run(line)
+			line = string.match(tostring(line or ""), "^%s*;?%s*(.-)%s*$")
+			if not line or line == "" then
+				return
+			end
+			if history[#history] ~= line then
+				table.insert(history, line)
+				if #history > 40 then
+					table.remove(history, 1)
+				end
+			end
+			historyPos = 0
+
+			local parts = {}
+			for word in string.gmatch(line, "%S+") do
+				table.insert(parts, word)
+			end
+			local name = string.lower(table.remove(parts, 1))
+			local cmd = lookup[name]
+			if not cmd then
+				notify("Unknown command: " .. name .. ". Type cmds for the list.", "error")
+				return
+			end
+			local ok, err = pcall(cmd.run, parts)
+			if not ok then
+				notify(name .. ": " .. tostring(err), "error")
+			end
+		end
+
+		connect(box:GetPropertyChangedSignal("Text"), function()
+			if string.find(box.Text, "\t", 1, true) then
+				box.Text = (string.gsub(box.Text, "\t", ""))
+				return
+			end
+			if box.Text ~= historyText then
+				historyPos = 0
+			end
+			updateSuggestions()
+		end)
+
+		connect(box.Focused, function()
+			tween(barStroke, 0.15, { Transparency = 0.15, Color = theme.accent })
+			updateSuggestions()
+		end)
+
+		connect(box.FocusLost, function(enterPressed)
+			tween(barStroke, 0.2, { Transparency = 0.8, Color = theme.white })
+			if enterPressed then
+				local text = box.Text
+				box.Text = ""
+				task.spawn(Cmdbar.Run, text)
+			end
+			-- small delay so tapping a suggestion can still reach it
+			task.delay(0.15, function()
+				if not box:IsFocused() then
+					preds.Visible = false
+				end
+			end)
+		end)
+
+		connect(UserInputService.InputBegan, function(input, processed)
+			if not Cmdbar.active or closing then
+				return
+			end
+			local key = input.KeyCode
+
+			if box:IsFocused() then
+				if key == Enum.KeyCode.Tab then
+					RunService.RenderStepped:Wait() -- let the box finish its own handling first
+					complete()
+				elseif key == Enum.KeyCode.Up or key == Enum.KeyCode.Down then
+					RunService.RenderStepped:Wait()
+					local step = key == Enum.KeyCode.Up and -1 or 1
+					if historyPos == 0 and #matches > 0 then
+						selected = (selected - 1 + step) % #matches + 1
+						renderSuggestions()
+					elseif #history > 0 then
+						historyPos = math.clamp(historyPos - step, 0, #history)
+						historyText = historyPos == 0 and "" or history[#history - historyPos + 1]
+						setText(historyText)
+					end
+				end
+				return
+			end
+
+			if processed or capturingKey then
+				return
+			end
+			if key == Enum.KeyCode.Semicolon then
+				box:CaptureFocus()
+				RunService.RenderStepped:Wait()
+				if string.sub(box.Text, -1) == ";" then
+					setText(string.sub(box.Text, 1, -2))
+				end
+			end
+		end)
+
+		-----------------------------------------------------------------
+		-- Switching between the window and the bar
+		-----------------------------------------------------------------
+		function Cmdbar.Enter()
+			if Cmdbar.active or closing then
+				return
+			end
+			Cmdbar.active = true
+			animId += 1
+			local id = animId
+			if Cmdbar.Toggle then
+				Cmdbar.Toggle.Set(true, true)
+			end
+
+			if minimized then
+				-- the window is already tucked away as the pill: hide that too
+				tween(pill, 0.2, { GroupTransparency = 1 })
+				tween(pillScale, 0.2, { Scale = 0.8 })
+				task.delay(0.2, function()
+					if animId == id then
+						pill.Visible = false
+					end
+				end)
+			else
+				pill.Visible = false
+				tween(main, 0.25, { GroupTransparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+				tween(mainScale, 0.25, { Scale = 0.92 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+				task.delay(0.27, function()
+					if animId == id then
+						main.Visible = false
+					end
+				end)
+				setBlur(false)
+			end
+
+			root.Visible = true
+			bar.Position = UDim2.new(0.5, 0, 1, HIDDEN_Y)
+			tween(bar, 0.45, { Position = UDim2.new(0.5, 0, 1, -BAR_GAP) }, Enum.EasingStyle.Back)
+			notify("Cmdbar on. Type cmds for the list, exitcmd to leave.", "info", 4)
+
+			-- phones keep the keyboard closed until the bar is tapped
+			if not UserInputService.TouchEnabled then
+				task.delay(0.5, function()
+					if Cmdbar.active and animId == id then
+						box:CaptureFocus()
+					end
+				end)
+			end
+		end
+
+		function Cmdbar.Exit()
+			if not Cmdbar.active then
+				return
+			end
+			Cmdbar.active = false
+			animId += 1
+			local id = animId
+			box:ReleaseFocus()
+			panel.Visible = false
+			preds.Visible = false
+			tween(bar, 0.3, { Position = UDim2.new(0.5, 0, 1, HIDDEN_Y) }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+			task.delay(0.32, function()
+				if animId == id then
+					root.Visible = false
+				end
+			end)
+
+			if minimized then
+				pillScale.Scale = 0.8
+				pill.Visible = true
+				tween(pill, 0.3, { GroupTransparency = 0 })
+				tween(pillScale, 0.45, { Scale = 1 }, Enum.EasingStyle.Back)
+			else
+				main.Visible = true
+				tween(main, 0.4, { GroupTransparency = 0 })
+				tween(mainScale, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
+				setBlur(true)
+			end
+			if Cmdbar.Toggle then
+				Cmdbar.Toggle.Set(false, true)
+			end
+		end
+
+		-----------------------------------------------------------------
+		-- Commands
+		-----------------------------------------------------------------
+		-- drives the matching GUI option when there is one (keeps its switch in sync), otherwise calls the module directly
+		local function setOption(key, value, fallback)
+			local comp = registry[key]
+			if comp then
+				comp.Set(value)
+			else
+				fallback(value)
+			end
+		end
+
+		-- no argument -> default; a bad argument -> nil (after telling the user)
+		local function numberArg(args, default, lo, hi)
+			local raw = args[1]
+			if raw == nil then
+				return default
+			end
+			local n = tonumber(raw)
+			if not n or n ~= n then
+				notify('"' .. raw .. "\" isn't a number", "warn")
+				return nil
+			end
+			return math.clamp(n, lo, hi)
+		end
+
+		local function needPlayer(args)
+			local query = args[1]
+			if not query then
+				notify("Add a player name", "warn")
+				return nil
+			end
+			local p = findPlayer(query)
+			if not p then
+				notify('No player matches "' .. query .. '"', "error")
+			end
+			return p
+		end
+
+		local function onOff(key, fallback, on, label)
+			setOption(key, on, fallback)
+			notify(label .. (on and " on" or " off"), on and "success" or "info")
+		end
+
+		Cmdbar.AddCommand("exitcmd", "", "Close the command bar and bring the window back", function()
+			Cmdbar.Exit()
+		end)
+
+		Cmdbar.AddCommand("cmds", "", "Show or hide this list", function()
+			setPanel(not panel.Visible)
+		end, { "commands", "help" })
+
+		Cmdbar.AddCommand("unload", "", "Close Toolx completely", function()
+			if Toolx and Toolx.Close then
+				Toolx.Close()
+			end
+		end, { "close" })
+
+		-- movement
+		Cmdbar.AddCommand("speed", "[num]", "Set your walkspeed (default 50)", function(args)
+			local v = numberArg(args, 50, 0, 10000)
+			if not v then
+				return
+			end
+			setOption("move.walkValue", v, Mods.SetWalkValue)
+			setOption("move.walk", true, Mods.SetWalk)
+			notify("WalkSpeed: " .. v, "success")
+		end, { "ws", "walkspeed" })
+
+		Cmdbar.AddCommand("unspeed", "", "Back to your normal walkspeed", function()
+			onOff("move.walk", Mods.SetWalk, false, "Custom walkspeed")
+		end, { "unws", "unwalkspeed" })
+
+		Cmdbar.AddCommand("jumppower", "[num]", "Set your jump power (default 100)", function(args)
+			local v = numberArg(args, 100, 0, 10000)
+			if not v then
+				return
+			end
+			setOption("move.jumpValue", v, Mods.SetJumpValue)
+			setOption("move.jump", true, Mods.SetJump)
+			notify("JumpPower: " .. v, "success")
+		end, { "jp", "jump" })
+
+		Cmdbar.AddCommand("unjumppower", "", "Back to your normal jump power", function()
+			onOff("move.jump", Mods.SetJump, false, "Custom jump power")
+		end, { "unjp", "unjump" })
+
+		Cmdbar.AddCommand("fly", "[speed]", "Start flying", function(args)
+			if args[1] then
+				local v = numberArg(args, nil, 0, 10000)
+				if v == nil then
+					return
+				end
+				setOption("move.flyValue", v, Mods.SetFlyValue)
+			end
+			onOff("move.fly", Mods.SetFly, true, "Fly")
+		end)
+
+		Cmdbar.AddCommand("unfly", "", "Stop flying", function()
+			onOff("move.fly", Mods.SetFly, false, "Fly")
+		end)
+
+		Cmdbar.AddCommand("noclip", "[wall]", "Walk through walls (add wall for Wall TP)", function(args)
+			local mode = (args[1] and string.find(string.lower(args[1]), "wall", 1, true)) and "Wall TP" or "Norm NC"
+			if Noclip.Drop then
+				Noclip.Drop.Set(mode) -- its callback switches noclip and notifies
+			else
+				Noclip.Set(mode)
+				notify("Noclip: " .. mode, "success")
+			end
+		end)
+
+		Cmdbar.AddCommand("clip", "", "Turn noclip off", function()
+			if Noclip.Drop then
+				Noclip.Drop.Set(nil)
+			else
+				Noclip.Set(nil)
+				notify("Noclip off", "info")
+			end
+		end)
+
+		Cmdbar.AddCommand("antifling", "", "Stop other players flinging you", function()
+			onOff("protect.antifling", Mods.SetAntiFling, true, "Anti-fling")
+		end)
+
+		Cmdbar.AddCommand("unantifling", "", "Turn anti-fling off", function()
+			onOff("protect.antifling", Mods.SetAntiFling, false, "Anti-fling")
+		end)
+
+		Cmdbar.AddCommand("antiafk", "", "Don't get kicked for idling", function()
+			setOption("util.antiafk", true, AntiAFK.Set) -- its callback notifies
+		end)
+
+		Cmdbar.AddCommand("unantiafk", "", "Turn anti-AFK off", function()
+			setOption("util.antiafk", false, AntiAFK.Set)
+		end)
+
+		Cmdbar.AddCommand("esp", "", "Outline and label every player", function()
+			onOff("esp.enabled", ESP.SetEnabled, true, "ESP")
+		end)
+
+		Cmdbar.AddCommand("unesp", "", "Turn ESP off", function()
+			onOff("esp.enabled", ESP.SetEnabled, false, "ESP")
+		end)
+
+		-- players and places
+		Cmdbar.AddCommand("goto", "[player]", "Teleport next to a player", function(args)
+			local p = needPlayer(args)
+			if p then
+				Teleport.ToPlayer(p)
+			end
+		end, { "tp", "to" })
+
+		Cmdbar.AddCommand("fling", "[player]", "Fling a player", function(args)
+			local p = needPlayer(args)
+			if p then
+				Teleport.FlingPlayer(p)
+			end
+		end)
+
+		Cmdbar.AddCommand("flingall", "", "Fling everyone in the server", function()
+			Teleport.FlingAll()
+		end)
+
+		Cmdbar.AddCommand("taketools", "[player]", "Copy a player's tools to your backpack", function(args)
+			local p = needPlayer(args)
+			if p then
+				Teleport.TakeTools(p)
+			end
+		end)
+
+		Cmdbar.AddCommand("spawn", "", "Teleport to a spawn (run again to cycle)", function()
+			Teleport.ToSpawn()
+		end, { "tospawn" })
+
+		Cmdbar.AddCommand("reset", "", "Respawn your character", function()
+			local char = player.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum then
+				hum.Health = 0
+			else
+				notify("Your character isn't loaded", "error")
+			end
+		end, { "re", "respawn" })
+
+		Cmdbar.AddCommand("rejoin", "", "Rejoin this server", function()
+			Server.Rejoin()
+		end, { "rj" })
+
+		Cmdbar.AddCommand("serverhop", "", "Move to a different public server", function()
+			Server.Hop()
+		end, { "hop" })
+	end
+	build()
 end
 
 Toolx = {}
@@ -10565,6 +11375,8 @@ Toolx.AddTab = addTab
 Toolx.Notify = notify
 Toolx.Version = VERSION
 Toolx.Gui = gui
+Toolx.Cmdbar = Cmdbar
+Toolx.AddCommand = Cmdbar.AddCommand
 
 connect(minBtn.Activated, minimize)
 connect(closeBtn.Activated, Toolx.Close)
@@ -10572,7 +11384,7 @@ connect(pillHit.Activated, restore)
 connect(pillClose.Activated, Toolx.Close)
 
 connect(UserInputService.InputBegan, function(input, processed)
-	if processed or closing or capturingKey then
+	if processed or closing or capturingKey or Cmdbar.active then
 		return
 	end
 	if toggleKey and input.KeyCode == toggleKey then

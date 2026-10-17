@@ -6951,11 +6951,11 @@ do
 			last = 0,
 			busy = false,
 			asset = nil,
-			file = "Toolx/roblox.m4a",
+			file = "Toolx/roblox.mp3",
 			urls = {
-				"https://github.com/redxs-dosx/scripts/raw/main/roblox.m4a",
-				"https://raw.githubusercontent.com/redxs-dosx/scripts/main/roblox.m4a",
-				"https://raw.githubusercontent.com/redxs-dosx/scripts/master/roblox.m4a",
+				"https://github.com/redxs-dosx/scripts/raw/main/roblox.mp3",
+				"https://raw.githubusercontent.com/redxs-dosx/scripts/main/roblox.mp3",
+				"https://raw.githubusercontent.com/redxs-dosx/scripts/master/roblox.mp3",
 			},
 		}
 
@@ -7016,6 +7016,7 @@ do
 			task.spawn(function()
 				local sound = new("Sound", { Name = "ToolxEgg", Volume = 1 }, game:GetService("SoundService"))
 				local duration = 3
+				local hasAudio, songEnded = false, false
 				local id = getSoundId()
 				if id and sound.Parent then
 					sound.SoundId = id
@@ -7024,7 +7025,11 @@ do
 						task.wait()
 					end
 					if sound.IsLoaded and sound.TimeLength > 0 then
-						duration = math.clamp(sound.TimeLength, 1, 10)
+						duration = sound.TimeLength + 1 -- safety cap only; the effect normally stops when the song ends
+						hasAudio = true
+						sound.Ended:Connect(function()
+							songEnded = true
+						end)
 						sound:Play()
 					else
 						notify("Couldn't play the audio", "warn")
@@ -7068,7 +7073,7 @@ do
 
 				RunService:BindToRenderStep(stepName, Enum.RenderPriority.Camera.Value + 1, function()
 					local el = os.clock() - startedAt
-					if el >= duration or not gui.Parent then
+					if songEnded or el >= duration or not gui.Parent then
 						finish()
 						return
 					end
@@ -12403,3 +12408,4 @@ pcall(function()
 end)
 
 return Toolx
+

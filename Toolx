@@ -94,14 +94,24 @@ local TITLE_H = 40
 ---------------------------------------------------------------------
 -- Helpers
 ---------------------------------------------------------------------
+local animationsEnabled = true -- toggled in Settings > Interface
+
 local function tween(obj, time, props, style, dir)
-	local tw = TweenService:Create(
-		obj,
-		TweenInfo.new(time, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out),
-		props
-	)
-	tw:Play()
-	return tw
+	if animationsEnabled then
+		local tw = TweenService:Create(
+			obj,
+			TweenInfo.new(time, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out),
+			props
+		)
+		tw:Play()
+		return tw
+	else
+		-- snap instantly when animations are off
+		for k, v in pairs(props) do
+			pcall(function() obj[k] = v end)
+		end
+		return nil
+	end
 end
 
 local function new(class, props, parent)
@@ -762,9 +772,12 @@ local mainScale = new("UIScale", { Scale = 0.9 }, main)
 corner(main, 14)
 stroke(main, 0.88)
 
--- Custom background image (Settings > Customization), drawn behind everything else in the window
+-- Wallpaper scope: "Whole GUI" = image fills the whole window (main); "Tab only" = image fills the content area only
+Appearance.wallpaperScope = "Whole GUI" -- "Whole GUI" | "Tab only"
+
+-- Wallpaper for the whole window (behind everything in main)
 Appearance.image = new("ImageLabel", {
-	Name = "BackgroundImage",
+	Name = "WallpaperImage",
 	Size = UDim2.fromScale(1, 1),
 	BackgroundTransparency = 1,
 	BorderSizePixel = 0,
@@ -775,6 +788,32 @@ Appearance.image = new("ImageLabel", {
 	Visible = false,
 }, main)
 corner(Appearance.image, 14)
+
+-- Wallpaper for the tab content area only (inside content frame, no rounded corners needed)
+Appearance.tabImage = new("ImageLabel", {
+	Name = "WallpaperTabImage",
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Image = "",
+	ImageTransparency = Appearance.bgT,
+	ScaleType = Enum.ScaleType.Crop,
+	ZIndex = 0,
+	Visible = false,
+}, nil) -- parented dynamically once content is created
+
+-- Internal helper: sync both image labels from a single source image/transparency
+function Appearance.syncWallpaper(assetId, transparency)
+	local t = transparency ~= nil and transparency or Appearance.bgT
+	local visible = (assetId or "") ~= ""
+	Appearance.image.Image = assetId or ""
+	Appearance.image.ImageTransparency = t
+	Appearance.image.Visible = Appearance.wallpaperScope == "Whole GUI" and visible
+
+	Appearance.tabImage.Image = assetId or ""
+	Appearance.tabImage.ImageTransparency = t
+	Appearance.tabImage.Visible = Appearance.wallpaperScope == "Tab only" and visible
+end
 
 do
 	local cam = workspace.CurrentCamera
@@ -1201,6 +1240,7 @@ local content = new("Frame", {
 	BackgroundTransparency = 1,
 	ClipsDescendants = true,
 }, main)
+Appearance.tabImage.Parent = content -- now that content exists
 
 ---------------------------------------------------------------------
 -- Tab system
@@ -10658,17 +10698,16 @@ do
 			main.GroupTransparency = Appearance.guiT
 		end
 	end, "ui.guiTransparency")
-	settingsTab:Slider("Background transparency (%)", 0, 100, math.floor(Appearance.bgT * 100 + 0.5), function(v)
+	settingsTab:Slider("Wallpaper transparency (%)", 0, 100, math.floor(Appearance.bgT * 100 + 0.5), function(v)
 		Appearance.bgT = v / 100
 		main.BackgroundTransparency = Appearance.bgT
-		Appearance.image.ImageTransparency = Appearance.bgT
+		Appearance.syncWallpaper(Appearance.image.Image, Appearance.bgT)
 	end, "ui.bgTransparency")
 
-	-- Background image: a link to a PNG / JPG, or a Roblox image ID
-	local Background = { spec = "", token = 0 }
-	local bgImage = Appearance.image
+	-- Wallpaper: a link to a PNG / JPG, or a Roblox image ID
+	local Wallpaper = { spec = "", token = 0 }
 
-	local modeChoice, bgInput, bgStatus
+	local modeChoice, bgInput, bgStatus, scopeChoice
 	local function setStatus(text)
 		bgStatus.Text = text
 	end
@@ -10679,17 +10718,18 @@ do
 		if not id then
 			return false, "Enter a numeric Roblox image ID."
 		end
-		local prevImage, prevVisible, prevAlpha = bgImage.Image, bgImage.Visible, bgImage.ImageTransparency
-		bgImage.ImageTransparency = 1 -- invisible while it loads
-		bgImage.Visible = true
-		bgImage.Image = "rbxassetid://" .. id
+		local probe = Appearance.image
+		local prevImage, prevVisible, prevAlpha = probe.Image, probe.Visible, probe.ImageTransparency
+		probe.ImageTransparency = 1
+		probe.Visible = true
+		probe.Image = "rbxassetid://" .. id
 		local waited = 0
-		while not bgImage.IsLoaded and waited < 4 do
+		while not probe.IsLoaded and waited < 4 do
 			task.wait(0.1)
 			waited += 0.1
 		end
-		if bgImage.IsLoaded then
-			bgImage.ImageTransparency = Appearance.bgT
+		if probe.IsLoaded then
+			Appearance.syncWallpaper("rbxassetid://" .. id)
 			return true
 		end
 		local ok, objs = pcall(function()
@@ -10701,16 +10741,13 @@ do
 			if o:IsA("Decal") or o:IsA("Texture") then
 				texture = o.Texture
 			end
-			pcall(function()
-				o:Destroy()
-			end)
+			pcall(function() o:Destroy() end)
 		end
 		if texture and texture ~= "" then
-			bgImage.Image = texture
-			bgImage.ImageTransparency = Appearance.bgT
+			Appearance.syncWallpaper(texture)
 			return true
 		end
-		bgImage.Image, bgImage.Visible, bgImage.ImageTransparency = prevImage, prevVisible, prevAlpha
+		probe.Image, probe.Visible, probe.ImageTransparency = prevImage, prevVisible, prevAlpha
 		return false, "Couldn't load that ID. It needs to be a public image."
 	end
 
@@ -10751,9 +10788,7 @@ do
 		if not okAsset or typeof(asset) ~= "string" then
 			return false, "Couldn't load the image."
 		end
-		bgImage.Image = asset
-		bgImage.ImageTransparency = Appearance.bgT
-		bgImage.Visible = true
+		Appearance.syncWallpaper(asset)
 		-- remove the images of earlier backgrounds
 		pcall(function()
 			for _, f in ipairs(listfiles(SAVE_FOLDER)) do
@@ -10766,14 +10801,14 @@ do
 		return true
 	end
 
-	local function applyBackground(mode, text)
+	local function applyWallpaper(mode, text)
 		text = (tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 		if text == "" then
 			setStatus("Enter a link or an ID first.")
 			return
 		end
-		Background.token += 1
-		local token = Background.token
+		Wallpaper.token += 1
+		local token = Wallpaper.token
 		setStatus("Loading...")
 		task.spawn(function()
 			local ok, err
@@ -10782,12 +10817,12 @@ do
 			else
 				ok, err = loadUrl(text)
 			end
-			if token ~= Background.token then
+			if token ~= Wallpaper.token then
 				return
 			end
 			if ok then
-				Background.spec = (mode == "Roblox ID" and "id|" or "url|") .. text
-				setStatus("Background set.")
+				Wallpaper.spec = (mode == "Roblox ID" and "id|" or "url|") .. text
+				setStatus("Wallpaper set.")
 				optionChanged()
 			else
 				setStatus(err or "Couldn't load that image.")
@@ -10796,42 +10831,54 @@ do
 		end)
 	end
 
-	local function clearBackground(silent)
-		Background.token += 1
-		bgImage.Visible = false
-		bgImage.Image = ""
-		Background.spec = ""
-		setStatus("No background set.")
+	local function clearWallpaper(silent)
+		Wallpaper.token += 1
+		Appearance.syncWallpaper("", Appearance.bgT)
+		Wallpaper.spec = ""
+		setStatus("No wallpaper set.")
 		if not silent then
 			optionChanged()
 		end
 	end
 
-	modeChoice = settingsTab:Choice("Background image", { "Image link", "Roblox ID" }, "Image link", function(mode)
+	-- Scope: Whole GUI or Tab only
+	scopeChoice = settingsTab:Choice("Wallpaper scope", { "Whole GUI", "Tab only" }, Appearance.wallpaperScope, function(scope)
+		Appearance.wallpaperScope = scope
+		-- re-apply current wallpaper to the right target
+		local currentId = Appearance.image.Image ~= "" and Appearance.image.Image
+			or Appearance.tabImage.Image ~= "" and Appearance.tabImage.Image
+			or nil
+		if currentId then
+			Appearance.syncWallpaper(currentId)
+		end
+		optionChanged()
+	end, "ui.wallpaperScope")
+
+	modeChoice = settingsTab:Choice("Wallpaper image", { "Image link", "Roblox ID" }, "Image link", function(mode)
 		bgInput.Box.PlaceholderText = mode == "Roblox ID" and "Image ID, e.g. 1234567890" or "https://.../image.png"
 	end)
 	bgInput = settingsTab:TextInput("Link / ID", "https://.../image.png", function(_, enter)
 		if enter then
-			applyBackground(modeChoice.Get(), bgInput.Get())
+			applyWallpaper(modeChoice.Get(), bgInput.Get())
 		end
 	end)
-	settingsTab:Button("Apply background", function()
-		applyBackground(modeChoice.Get(), bgInput.Get())
+	settingsTab:Button("Apply wallpaper", function()
+		applyWallpaper(modeChoice.Get(), bgInput.Get())
 	end)
-	settingsTab:Button("Remove background", function()
-		clearBackground()
+	settingsTab:Button("Remove wallpaper", function()
+		clearWallpaper()
 	end)
-	bgStatus = settingsTab:Label("No background set.")
+	bgStatus = settingsTab:Label("No wallpaper set.")
 	settingsTab:Label("Links must point straight at a PNG or JPG file and need an executor with getcustomasset. A Roblox ID is the image's asset ID.")
 
 	-- saved with Keep options as "link|<url>" / "id|<number>"
 	registry["ui.background"] = {
 		Get = function()
-			return Background.spec
+			return Wallpaper.spec
 		end,
 		Set = function(value)
 			if value == "" then
-				clearBackground(true)
+				clearWallpaper(true)
 				return
 			end
 			local kind, text = tostring(value):match("^(%a+)|(.+)$")
@@ -10840,7 +10887,20 @@ do
 				modeChoice.Set(mode, true)
 				bgInput.Box.PlaceholderText = mode == "Roblox ID" and "Image ID, e.g. 1234567890" or "https://.../image.png"
 				bgInput.Set(text)
-				applyBackground(mode, text)
+				applyWallpaper(mode, text)
+			end
+		end,
+	}
+	registry["ui.wallpaperScope"] = {
+		Get = function()
+			return Appearance.wallpaperScope
+		end,
+		Set = function(value)
+			if value == "Whole GUI" or value == "Tab only" then
+				Appearance.wallpaperScope = value
+				if scopeChoice then
+					scopeChoice.Set(value, true)
+				end
 			end
 		end,
 	}
@@ -10856,6 +10916,10 @@ settingsTab:Toggle("Notifications", true, function(state)
 		notify("Notifications on", "success")
 	end
 end, "ui.notifications")
+settingsTab:Toggle("Animations", true, function(state)
+	animationsEnabled = state
+end, "ui.animations")
+settingsTab:Label("When off, GUI transitions snap instantly instead of tweening. Useful on low-end devices.")
 settingsTab:Keybind("Toggle key", "RightShift", function(name)
 	toggleKey = name ~= "None" and Enum.KeyCode[name] or nil
 	notify("Toggle key: " .. name)

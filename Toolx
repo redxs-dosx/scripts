@@ -11185,6 +11185,7 @@ end)
 ---------------------------------------------------------------------
 -- Minimized squircle (replaces the old pill)
 ---------------------------------------------------------------------
+local restore -- forward declaration: assigned below, the squircle tap handler needs it
 local PILL_SIZE = 48 -- squircle side length
 local PILL_Y    = 12 -- default top offset from screen edge
 -- Default resting position: top-centre of the screen
@@ -11372,7 +11373,7 @@ local function minimize()
 	end)
 end
 
-local function restore()
+function restore()
 	if not minimized or closing or Cmdbar.active then
 		return
 	end

@@ -10054,9 +10054,14 @@ local function getBuiltArguments()
 	return args
 end
 
+local foundRemotes = {} -- remotes the last scan got a response from, used by Burst Fire
+local burstCount = 50
+local burstBusy = false
+
 scannerTab:Button("Run Scan", function(lbl)
 	lbl.Text = "Scanning..."
 	scanResultsBox.Clear()
+	table.clear(foundRemotes)
 	
 	task.spawn(function()
 		local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -10082,6 +10087,7 @@ scannerTab:Button("Run Scan", function(lbl)
 						end)
 						if ok then
 							count += 1
+							table.insert(foundRemotes, descendant)
 							local remoteObj = descendant
 							scanResultsBox.Add(
 								string.format('<font color="#4cc978">%s</font> (%s)', escapeRich(remoteObj.Name), escapeRich(remoteObj.ClassName)),
@@ -10114,6 +10120,79 @@ scannerTab:Button("Run Scan", function(lbl)
 		notify(string.format("Scan complete: found %d responsive remotes", count), "success")
 	end)
 end)
+
+scannerTab:Slider("Burst count (per remote)", 1, 200, 50, function(v)
+	burstCount = math.floor(v)
+end, "scanner.burstCount")
+
+scannerTab:Button("Burst Fire", function(lbl)
+	if burstBusy then
+		return
+	end
+	local remotes = {}
+	for _, remote in ipairs(foundRemotes) do
+		if remote.Parent then
+			table.insert(remotes, remote)
+		end
+	end
+
+	-- works without a scan too: with no remotes it just builds the tables and sends nothing
+	local perRemote = burstCount
+	local total = perRemote * math.max(#remotes, 1)
+	local baseArgs = getBuiltArguments()
+	local original = lbl.Text
+	burstBusy = true
+
+	local function makeTable(n)
+		local t = { index = n, stamp = os.clock() }
+		for i = 1, 8 do
+			t[i] = math.random(1, 1000000)
+		end
+		t.nested = { id = n, list = { n, n + 1, n + 2 }, flag = n % 2 == 0 }
+		return t
+	end
+
+	local done, sent = 0, 0
+	local function step()
+		done += 1
+		if done % 20 == 0 then
+			lbl.Text = string.format("Working %d/%d", done, total)
+			task.wait() -- 20 per frame
+		end
+	end
+
+	for _ = 1, perRemote do
+		if not lbl.Parent then
+			burstBusy = false
+			return
+		end
+		if #remotes == 0 then
+			makeTable(done + 1)
+			step()
+		else
+			for _, remote in ipairs(remotes) do
+				local callArgs = table.clone(baseArgs)
+				table.insert(callArgs, makeTable(done + 1))
+				if remote:IsA("RemoteEvent") then
+					pcall(remote.FireServer, remote, unpack(callArgs))
+				else
+					task.spawn(pcall, remote.InvokeServer, remote, unpack(callArgs)) -- InvokeServer waits for a reply
+				end
+				sent += 1
+				step()
+			end
+		end
+	end
+
+	lbl.Text = original
+	burstBusy = false
+	if #remotes == 0 then
+		notify(string.format("Built %d tables (no remotes found, nothing sent)", done), "success")
+	else
+		notify(string.format("Burst sent: %d calls to %d remotes, a new table each", sent, #remotes), "success")
+	end
+end)
+scannerTab:Label("Burst Fire sends the arguments above plus a freshly built table to every remote the scan found, Burst count times each, 20 calls per frame. With no scan (or no remotes) it just builds the tables.")
 
 scanResultsBox = scannerTab:LogBox(140, 40, "No scan performed yet")
 

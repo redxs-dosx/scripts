@@ -11185,11 +11185,11 @@ end)
 ---------------------------------------------------------------------
 -- Minimized squircle (replaces the old pill)
 ---------------------------------------------------------------------
-local PILL_SIZE = 64 -- squircle side length
+local PILL_SIZE = 48 -- squircle side length
 local PILL_Y    = 12 -- default top offset from screen edge
 -- Default resting position: top-centre of the screen
 local pillDefaultPos = UDim2.new(0.5, -PILL_SIZE / 2, 0, PILL_Y)
--- The point the main window shrinks toward when minimizing
+-- The point the main window shrinks toward when minimizing (center of squircle)
 local pillCenter     = UDim2.new(0.5, 0, 0, PILL_Y + PILL_SIZE / 2)
 
 local pill = new("CanvasGroup", {
@@ -11204,10 +11204,10 @@ local pill = new("CanvasGroup", {
 	Visible = false,
 }, gui)
 local pillScale = new("UIScale", { Scale = 0.8 }, pill)
-corner(pill, 20) -- high radius → squircle feel
+corner(pill, 14) -- squircle feel
 stroke(pill, 0.82)
 
--- Accent glow ring (subtle inner ring that matches the accent colour)
+-- Accent glow ring
 local pillRing = new("Frame", {
 	AnchorPoint = Vector2.new(0.5, 0.5),
 	Position = UDim2.fromScale(0.5, 0.5),
@@ -11217,14 +11217,14 @@ local pillRing = new("Frame", {
 	BorderSizePixel = 0,
 	ZIndex = 0,
 }, pill)
-corner(pillRing, 17)
+corner(pillRing, 12)
 
 -- Logo image (mirrors the title-bar logo; updated by showLogo / setLogo)
 local pillLogoImg = new("ImageLabel", {
 	Name = "PillLogo",
 	AnchorPoint = Vector2.new(0.5, 0.5),
 	Position = UDim2.fromScale(0.5, 0.5),
-	Size = UDim2.fromOffset(38, 38),
+	Size = UDim2.fromOffset(28, 28),
 	BackgroundTransparency = 1,
 	ScaleType = Enum.ScaleType.Fit,
 	Image = "",
@@ -11236,14 +11236,14 @@ local pillLogoImg = new("ImageLabel", {
 local pillDotFb = new("Frame", {
 	AnchorPoint = Vector2.new(0.5, 0.5),
 	Position = UDim2.fromScale(0.5, 0.5),
-	Size = UDim2.fromOffset(16, 16),
+	Size = UDim2.fromOffset(12, 12),
 	BackgroundColor3 = theme.accent,
 	BorderSizePixel = 0,
 	ZIndex = 2,
 }, pill)
-corner(pillDotFb, 8)
+corner(pillDotFb, 6)
 
--- Full-size invisible hit area so the whole squircle is tappable/clickable
+-- Hit area on top of everything — drag AND tap both go through here
 local pillHit = new("TextButton", {
 	Text = "",
 	AutoButtonColor = false,
@@ -11251,14 +11251,6 @@ local pillHit = new("TextButton", {
 	Size = UDim2.fromScale(1, 1),
 	ZIndex = 3,
 }, pill)
-
--- Hover highlight
-connect(pillHit.MouseEnter, function()
-	tween(pill, 0.15, { BackgroundTransparency = 0 })
-end)
-connect(pillHit.MouseLeave, function()
-	tween(pill, 0.15, { BackgroundTransparency = 0.08 })
-end)
 
 -- Keep the squircle's accent ring in sync with theme changes
 local _origSpookyApply = Spooky.apply
@@ -11285,14 +11277,18 @@ if LOGO.assets[LOGO.wanted] then
 	pillDotFb.Visible = false
 end
 
--- Dragging the squircle
+-- Drag + tap on pillHit (top ZIndex captures all input)
 do
-	local dragging, dragInput, dragStart, startPos
+	local dragging = false
+	local dragInput, dragStart, startPos
+	local DRAG_THRESHOLD = 4 -- pixels moved before it counts as a drag, not a tap
+	local wasDrag = false
 
-	connect(pill.InputBegan, function(input)
+	connect(pillHit.InputBegan, function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1
 			or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = true
+			wasDrag = false
 			dragStart = input.Position
 			startPos = pill.Position
 			local c
@@ -11300,17 +11296,21 @@ do
 				if input.UserInputState == Enum.UserInputState.End then
 					dragging = false
 					c:Disconnect()
-					-- update pillCenter so restore/minimize animate to the new spot
+					-- update pillCenter so future minimize aims at the new spot
 					pillCenter = UDim2.new(
 						pill.Position.X.Scale, pill.Position.X.Offset + PILL_SIZE / 2,
 						pill.Position.Y.Scale, pill.Position.Y.Offset + PILL_SIZE / 2
 					)
+					-- if the user barely moved, treat it as a tap → restore
+					if not wasDrag then
+						restore()
+					end
 				end
 			end)
 		end
 	end)
 
-	connect(pill.InputChanged, function(input)
+	connect(pillHit.InputChanged, function(input)
 		if input.UserInputType == Enum.UserInputType.MouseMovement
 			or input.UserInputType == Enum.UserInputType.Touch then
 			dragInput = input
@@ -11320,16 +11320,21 @@ do
 	connect(UserInputService.InputChanged, function(input)
 		if dragging and input == dragInput then
 			local d = input.Position - dragStart
-			pill.Position = UDim2.new(
-				startPos.X.Scale, startPos.X.Offset + d.X,
-				startPos.Y.Scale, startPos.Y.Offset + d.Y
-			)
+			if not wasDrag and (math.abs(d.X) > DRAG_THRESHOLD or math.abs(d.Y) > DRAG_THRESHOLD) then
+				wasDrag = true
+			end
+			if wasDrag then
+				pill.Position = UDim2.new(
+					startPos.X.Scale, startPos.X.Offset + d.X,
+					startPos.Y.Scale, startPos.Y.Offset + d.Y
+				)
+			end
 		end
 	end)
 end
 
 -- pillClose no longer exists; closing is done from the main window
-local pillClose = nil -- kept as a nil sentinel so Toolx.Close wiring below is a no-op
+local pillClose = nil
 
 ---------------------------------------------------------------------
 -- Window state + animations
@@ -12241,7 +12246,7 @@ Toolx.AddCommand = Cmdbar.AddCommand
 
 connect(minBtn.Activated, minimize)
 connect(closeBtn.Activated, Toolx.Close)
-connect(pillHit.Activated, restore)
+-- pillHit tap-to-restore is handled inside the drag block (tap = InputEnd without crossing DRAG_THRESHOLD)
 -- pillClose was removed (squircle has no close button; close from the main window instead)
 
 connect(UserInputService.InputBegan, function(input, processed)

@@ -8650,6 +8650,8 @@ do
 		fov        = 120,   -- radius in pixels
 		teamCheck  = true,
 		wallCheck  = true,
+		targetPart = "Head", -- "Head", "Torso" or "Nearest part"
+		smooth     = 75,     -- 0 = instant lock, 100 = very slow / smooth
 	}
 
 	-- FOV circle drawn on a ScreenGui that sits above everything
@@ -8735,7 +8737,33 @@ do
 		return true
 	end
 
-	-- Returns the closest target head inside the FOV circle, or nil
+	-- Parts of a character the aimbot may aim at for the current "Target part" setting (R6 and R15)
+	local TORSO_NAMES = { "UpperTorso", "Torso", "HumanoidRootPart" }
+	local NEAREST_NAMES = {
+		"Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso",
+		"LeftUpperArm", "RightUpperArm", "Left Arm", "Right Arm",
+		"LeftUpperLeg", "RightUpperLeg", "Left Leg", "Right Leg",
+	}
+	local function candidateParts(char)
+		local out = {}
+		if cfg.targetPart == "Head" then
+			local h = char:FindFirstChild("Head")
+			if h then out[1] = h end
+		elseif cfg.targetPart == "Torso" then
+			for _, n in ipairs(TORSO_NAMES) do
+				local t = char:FindFirstChild(n)
+				if t and t:IsA("BasePart") then out[1] = t break end
+			end
+		else
+			for _, n in ipairs(NEAREST_NAMES) do
+				local t = char:FindFirstChild(n)
+				if t and t:IsA("BasePart") then out[#out + 1] = t end
+			end
+		end
+		return out
+	end
+
+	-- Returns the closest target part inside the FOV circle, or nil
 	local function getBestTarget()
 		local cam = workspace.CurrentCamera
 		if not cam then return nil end
@@ -8762,22 +8790,23 @@ do
 
 			local char = p.Character
 			local hum = char and char:FindFirstChildOfClass("Humanoid")
-			local head = char and char:FindFirstChild("Head")
-			if not (char and hum and head and hum.Health > 0) then continue end
+			if not (char and hum and hum.Health > 0) then continue end
 
-			-- screen-space distance from the crosshair (cheap, so check it before the raycast)
-			local screenPos, onScreen = cam:WorldToViewportPoint(head.Position)
-			if not onScreen then continue end
-			local dx, dy = screenPos.X - cx, screenPos.Y - cy
-			local dSq = dx * dx + dy * dy
-			if dSq >= fovSq or dSq >= bestDist then continue end
+			for _, part in ipairs(candidateParts(char)) do
+				-- screen-space distance from the crosshair (cheap, so check it before the raycast)
+				local screenPos, onScreen = cam:WorldToViewportPoint(part.Position)
+				if not onScreen then continue end
+				local dx, dy = screenPos.X - cx, screenPos.Y - cy
+				local dSq = dx * dx + dy * dy
+				if dSq >= fovSq or dSq >= bestDist then continue end
 
-			if cfg.wallCheck and blocked(cam.CFrame.Position, head.Position, ignore) then
-				continue
+				if cfg.wallCheck and blocked(cam.CFrame.Position, part.Position, ignore) then
+					continue
+				end
+
+				bestDist = dSq
+				best = part
 			end
-
-			bestDist = dSq
-			best = head
 		end
 		return best
 	end
@@ -8794,7 +8823,10 @@ do
 			if not target then return end
 			-- smoothly rotate the camera toward the target
 			local goal = CFrame.new(cam.CFrame.Position, target.Position)
-			cam.CFrame = cam.CFrame:Lerp(goal, 1 - 0.75 ^ (math.min(dt, 0.1) * 60))
+			-- smooth 0 = instant lock; higher = slower. Frame-rate independent.
+			local keep = 0.98 * cfg.smooth / 100 -- share of the gap left over after one 60 fps frame
+			local alpha = 1 - keep ^ (math.min(dt, 0.1) * 60)
+			cam.CFrame = cam.CFrame:Lerp(goal, alpha)
 		end)
 	end
 	local function stopLoop()
@@ -8820,6 +8852,17 @@ do
 		if n and n >= 10 and n <= 600 then
 			cfg.fov = n
 			updateFovSize()
+		end
+	end
+	function Aimbot.SetTargetPart(name)
+		if name == "Head" or name == "Torso" or name == "Nearest part" then
+			cfg.targetPart = name
+		end
+	end
+	function Aimbot.SetSmooth(v)
+		local n = tonumber(v)
+		if n then
+			cfg.smooth = math.clamp(n, 0, 100)
 		end
 	end
 	function Aimbot.SetTeamCheck(on)
@@ -9836,6 +9879,12 @@ end, "aimbot.enabled")
 graphicsTab:Input("FOV radius (px)", 120, function(v)
 	Aimbot.SetFov(v)
 end, "aimbot.fov", 10, 600)
+graphicsTab:Choice("Target part", { "Head", "Torso", "Nearest part" }, "Head", function(name)
+	Aimbot.SetTargetPart(name)
+end, "aimbot.targetPart")
+graphicsTab:Slider("Smoothness (0 = instant lock)", 0, 100, 75, function(v)
+	Aimbot.SetSmooth(v)
+end, "aimbot.smooth")
 graphicsTab:Toggle("Team check", true, function(state)
 	Aimbot.SetTeamCheck(state)
 end, "aimbot.teamCheck")

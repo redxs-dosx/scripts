@@ -8664,14 +8664,17 @@ do
 			Name              = "ToolxAimbotFov",
 			ResetOnSpawn      = false,
 			IgnoreGuiInset    = true,
-			DisplayOrder      = 999,
+			DisplayOrder      = 50, -- well below the main Toolx window (999), so the window always draws on top
 			ZIndexBehavior    = Enum.ZIndexBehavior.Sibling,
 		})
+		-- same parent as the main window: DisplayOrder only compares guis that share a parent,
+		-- so a CoreGui circle would draw over a window that lives somewhere else
+		local parent = gui.Parent or game:GetService("CoreGui")
 		local ok = pcall(function()
-			fovGui.Parent = game:GetService("CoreGui")
+			fovGui.Parent = parent
 		end)
-		if not ok or not fovGui.Parent then
-			fovGui.Parent = gui
+		if not ok or fovGui.Parent ~= parent then
+			fovGui.Parent = player:FindFirstChildOfClass("PlayerGui") -- a ScreenGui can't sit inside another ScreenGui
 		end
 		-- draw circle via ImageLabel with a circular asset (UICorner trick on a Frame)
 		local d = cfg.fov * 2
